@@ -174,12 +174,16 @@ class BacktestWorker(QThread):
                 # Emit update
                 self.progress.emit(self.timeframe, ts, actual, predicted, is_success)
 
-                # Small delay to keep the app responsive and prevent CPU 100% saturation
-                # This allows the GUI thread to process signals more smoothly.
+                # Dynamic delay based on total_count to keep the app responsive as data grows.
+                # As total_count increases, we increase the pause to give the GUI thread more time
+                # to process the increasingly heavy setData() calls.
                 if i % 10 == 0:
-                    time.sleep(0.001)
+                    # Gradually increase sleep: 5ms base + 2ms per 50 points
+                    # This provides a more aggressive delay as data grows to keep the GUI responsive.
+                    dynamic_pause = 0.005 + (total_count / 50) * 0.002
+                    time.sleep(dynamic_pause)
                 else:
-                    time.sleep(0.00001)
+                    time.sleep(0.0001) # Increased from 0.00001 to give a bit more breathing room
 
             final_rate = (success_count / total_count * 100) if total_count > 0 else 0
             self.finished.emit(self.timeframe, final_rate)
