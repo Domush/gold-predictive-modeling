@@ -488,6 +488,7 @@ class GoldBacktester(QMainWindow):
         self.backtest_btn.setEnabled(False)
         self.backtest_btn.clicked.connect(self.on_start_backtest)
         self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.on_stop_backtest)
 
         btn_layout.addWidget(self.update_btn)
@@ -653,6 +654,7 @@ class GoldBacktester(QMainWindow):
         try:
             compile(code, '<string>', 'exec')
             self.backtest_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
             self.update_btn.setStyleSheet("background-color: #27ae60;")
 
             # Save to history if changed
@@ -664,6 +666,7 @@ class GoldBacktester(QMainWindow):
                 self.save_settings() # Persist history change
         except Exception as e:
             self.backtest_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
             self.update_btn.setStyleSheet("background-color: #c0392b;")
             QMessageBox.warning(self, "Syntax Error", str(e))
 
@@ -672,6 +675,7 @@ class GoldBacktester(QMainWindow):
         if 0 <= idx < len(self.code_history):
             self.code_editor.setPlainText(self.code_history[idx][1])
             self.backtest_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
             self.update_btn.setStyleSheet("")
 
     def on_history_context_menu(self, pos):
@@ -762,6 +766,7 @@ class GoldBacktester(QMainWindow):
             worker.start()
 
         self.backtest_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
 
     @Slot(str, float, float, float, bool)
     def update_plot(self, tf, ts, actual, predicted, is_success):
@@ -798,6 +803,7 @@ class GoldBacktester(QMainWindow):
             del self.workers[tf]
         if not self.workers:
             self.backtest_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
 
     @Slot(str)
     def on_worker_error(self, msg):
@@ -812,6 +818,7 @@ class GoldBacktester(QMainWindow):
             del self.workers[tf]
         if not self.workers:
             self.backtest_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
 
     @Slot()
     def on_stop_backtest(self):
@@ -820,6 +827,7 @@ class GoldBacktester(QMainWindow):
             worker.wait()
         self.workers.clear()
         self.backtest_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
     def on_mouse_moved(self, pos, tf):
         """
@@ -870,25 +878,38 @@ class GoldBacktester(QMainWindow):
                 pred_val = predicts_y[closest_idx]
                 is_success = successes[closest_idx]
 
+                # Calculate changes from previous actual
+                prev_actual = actuals[closest_idx - 1] if closest_idx > 0 else actual_val
+                pred_change = pred_val - prev_actual
+                actual_change = actual_val - prev_actual
+                diff = pred_val - actual_val
+
+                # Colors and symbols
+                def get_color(val):
+                    return "#27ae60" if val >= 0 else "#e74c3c"
+
+                status_icon = "<span style='color: #27ae60'>✔</span>" if is_success else "<span style='color: #e74c3c'>✘</span>"
+
                 # Update crosshair to follow cursor
                 components['vLine'].setPos(mousePoint.x())
                 components['hLine'].setPos(mousePoint.y())
 
                 # Update tooltip text
-                # Convert timestamp of the closest point to human readable date
                 time_str = pd.to_datetime(actual_ts, unit='s').strftime('%Y-%m-%d %H:%M')
 
-                # Calculate signed difference
-                diff = pred_val - actual_val
+                text = f"<span style='color: white'>{time_str}</span><br>"
 
-                # Status and colors
-                status_color = "#27ae60" if is_success else "#e74c3c"
-                pred_color = "#27ae60" if pred_val > actual_val else "#e74c3c"
+                # Prediction line
+                text += f"<span style='color: white'>P: {pred_val:.2f} </span>"
+                text += f"<span style='color: {get_color(pred_change)}'>({pred_change:+.2f})</span><br>"
 
-                text = f"<span style='color: white'>Time: {time_str}</span><br>"
-                text += f"<span style='color: #3498db'>Actual: {actual_val:.2f}</span><br>"
-                text += f"<span style='color: {pred_color}'>Predicted: {pred_val:.2f}</span><br>"
-                text += f"<span style='color: {status_color}; font-weight: bold'>Diff: {diff:+.2f}</span>"
+                # Actual line
+                text += f"<span style='color: white'>A: {actual_val:.2f} </span>"
+                text += f"<span style='color: {get_color(actual_change)}'>({actual_change:+.2f})</span><br>"
+
+                # Diff and Status
+                text += f"<span style='color: white'>≅: </span>"
+                text += f"<span style='color: {get_color(diff)}'>{diff:+.2f} </span>{status_icon}"
 
                 components['label'].setHtml(text)
                 # Attach tooltip to cursor
