@@ -13,8 +13,9 @@ import pyqtgraph as pg
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTabWidget, QPushButton, QLabel,
                              QPlainTextEdit, QLineEdit, QFormLayout, QGroupBox,
-                             QListWidget, QSplitter, QMessageBox, QCheckBox)
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+                             QListWidget, QSplitter, QMessageBox, QCheckBox,
+                             QMenu)
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QSettings, QTimer
 from PySide6.QtGui import QFont, QColor
 
 from data_engine import DataEngine
@@ -22,8 +23,8 @@ from highlighter import PygmentsHighlighter
 
 # --- Worker Thread ---
 class BacktestWorker(QThread):
-    # Signals: timeframe, index, actual, predicted, is_success
-    progress = Signal(str, int, float, float, bool)
+    # Signals: timeframe, timestamp, actual, predicted, is_success
+    progress = Signal(str, float, float, float, bool)
     finished = Signal(str, float)
     error = Signal(str)
     aborted = Signal(str, str)
@@ -67,8 +68,8 @@ class BacktestWorker(QThread):
 
                 window = self.data.iloc[i-10:i]
                 actual = self.data.iloc[i]['Close']
+                ts = float(self.data.index[i].timestamp())
                 prev_close = self.data.iloc[i-1]['Close']
-
                 ohlcv_data = window[['Open', 'High', 'Low', 'Close', 'Volume']].values
 
                 try:
@@ -97,7 +98,7 @@ class BacktestWorker(QThread):
                 total_count += 1
 
                 # Emit update
-                self.progress.emit(self.timeframe, i, actual, predicted, is_success)
+                self.progress.emit(self.timeframe, ts, actual, predicted, is_success)
 
                 # Small delay to keep the app responsive and prevent CPU 100% saturation
                 # This allows the GUI thread to process signals more smoothly.
@@ -119,18 +120,84 @@ class GoldBacktester(QMainWindow):
         self.setWindowTitle("Gold Futures Backtester Pro")
         self.resize(1400, 900)
 
+        self.settings = QSettings("GoldPredictive", "Backtester")
         self.data_engine = DataEngine("data/XAU_1m_data.csv")
         self.workers = {}
-        self.code_history = []
+        self.code_history = [] # List of tuples: (timestamp, code)
         self.timeframes = ['1m', '5m', '15m', '30m', '1h', '1d']
         self.active_timeframes = []
+        self.plot_components = {}
 
         # Plot data storage
-        self.plot_data = {tf: {'indices': [], 'actuals': [], 'predicts_x': [], 'predicts_y': []} for tf in self.timeframes}
+        self.plot_data = {tf: {
+            'indices': [],
+            'actuals': [],
+            'predicts_x': [],
+            'predicts_y': [],
+            'colors': [], # List of brush colors
+            'success_count': 0
+        } for tf in self.timeframes}
 
         self.init_ui()
         self.apply_dark_theme()
-        self.load_initial_code()
+
+        # Load saved settings and history
+        self.load_settings()
+
+        # If no code in settings/history, load from file
+        if not self.code_editor.toPlainText().strip():
+            self.load_initial_code()
+
+        # Attempt to load data on startup
+        QTimer.singleShot(100, self.on_load_data)
+
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
+
+    def save_settings(self):
+        # Save thresholds and other UI states
+        self.settings.setValue("up_thresh", self.up_thresh.text())
+        self.settings.setValue("down_thresh", self.down_thresh.text())
+        self.settings.setValue("abort_thresh", self.abort_thresh.text())
+        self.settings.setValue("active_tab", self.tabs.currentIndex())
+        self.settings.setValue("current_code", self.code_editor.toPlainText())
+
+        # Save checkboxes
+        tf_states = {tf: cb.isChecked() for tf, cb in self.tf_checks.items()}
+        self.settings.setValue("tf_states", tf_states)
+
+        # Save history
+        self.settings.setValue("history", self.code_history)
+
+    def load_settings(self):
+        self.up_thresh.setText(self.settings.value("up_thresh", "10.0"))
+        self.down_thresh.setText(self.settings.value("down_thresh", "2.0"))
+        self.abort_thresh.setText(self.settings.value("abort_thresh", "100.0"))
+
+        active_tab = self.settings.value("active_tab", 0)
+        self.tabs.setCurrentIndex(int(active_tab))
+
+        # Restore checkboxes
+        tf_states = self.settings.value("tf_states", {})
+        if tf_states:
+            for tf, checked in tf_states.items():
+                if tf in self.tf_checks:
+                    # QSettings returns strings for bools sometimes depending on platform
+                    is_checked = str(checked).lower() == 'true'
+                    self.tf_checks[tf].setChecked(is_checked)
+
+        # Restore current code
+        current_code = self.settings.value("current_code", "")
+        if current_code:
+            self.code_editor.setPlainText(current_code)
+
+        # Restore history
+        saved_history = self.settings.value("history", [])
+        if saved_history:
+            self.code_history = saved_history
+            for timestamp, code in self.code_history:
+                self.history_list.addItem(f"Revision {self.history_list.count()+1} - {timestamp}")
 
     def init_ui(self):
         central_widget = QWidget()
@@ -152,10 +219,20 @@ class GoldBacktester(QMainWindow):
         self.load_btn.clicked.connect(self.on_load_data)
         self.convert_btn = QPushButton("Convert to Feather")
         self.convert_btn.clicked.connect(self.on_convert_feather)
+
+        # Status Indicator
+        self.status_label = QLabel("Data: Not Loaded")
+        self.status_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+
         data_vbox.addWidget(self.load_btn)
         data_vbox.addWidget(self.convert_btn)
+        data_vbox.addWidget(self.status_label)
         data_group.setLayout(data_vbox)
         sidebar_layout.addWidget(data_group)
+
+        # Check feather existence and hide convert button if it exists
+        if os.path.exists(self.data_engine.feather_path):
+            self.convert_btn.hide()
 
         # Timeframe Selection
         tf_group = QGroupBox("Select Timeframes")
@@ -186,6 +263,8 @@ class GoldBacktester(QMainWindow):
         hist_vbox = QVBoxLayout()
         self.history_list = QListWidget()
         self.history_list.itemClicked.connect(self.on_history_select)
+        self.history_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.history_list.customContextMenuRequested.connect(self.on_history_context_menu)
         hist_vbox.addWidget(self.history_list)
         hist_group.setLayout(hist_vbox)
         sidebar_layout.addWidget(hist_group)
@@ -207,10 +286,15 @@ class GoldBacktester(QMainWindow):
             tab = QWidget()
             tab_layout = QVBoxLayout(tab)
 
-            # Plot
-            pw = pg.PlotWidget(title=f"Gold Futures - {tf}")
+            # Create Plot with Date Axis
+            axis = pg.DateAxisItem(orientation='bottom')
+            pw = pg.PlotWidget(title=f"Gold Futures - {tf}", axisItems={'bottom': axis})
             pw.setBackground('#121212')
             pw.showGrid(x=True, y=True, alpha=0.3)
+            pw.addLegend()
+
+            # Enable tooltips on the plot
+            pw.setMouseEnabled(x=True, y=True)
 
             # Success Rate Label
             rate_label = QLabel("Success Rate: 0.00%")
@@ -225,8 +309,30 @@ class GoldBacktester(QMainWindow):
             self.tabs.addTab(tab, tf)
 
             # Lines
-            self.plot_items[tf] = pw.plot(pen=pg.mkPen(color='#3498db', width=1.5))
-            self.predict_items[tf] = pw.plot(pen=None, symbol='o', symbolSize=4, symbolBrush='#e74c3c')
+            self.plot_items[tf] = pw.plot(pen=pg.mkPen(color='#3498db', width=1.5), name="Actual")
+            self.predict_items[tf] = pw.plot(pen=None, symbol='o', symbolSize=6, symbolBrush='#e74c3c', name="Predicted")
+
+            # Create crosshair lines
+            vLine = pg.InfiniteLine(angle=90, movable=False, pen='#666')
+            hLine = pg.InfiniteLine(angle=0, movable=False, pen='#666')
+            pw.addItem(vLine, ignoreBounds=True)
+            pw.addItem(hLine, ignoreBounds=True)
+
+            # Text item for tooltip-like display
+            label = pg.TextItem(anchor=(0, 1), color='#fff', fill='#333', border='#555')
+            label.setZValue(100)
+            pw.addItem(label, ignoreBounds=True)
+
+            # Store components for hover logic
+            self.plot_components[tf] = {
+                'vLine': vLine,
+                'hLine': hLine,
+                'label': label,
+                'vb': pw.getViewBox()
+            }
+
+            # Connect hover signal using a lambda to pass the timeframe
+            pw.scene().sigMouseMoved.connect(lambda pos, t=tf: self.on_mouse_moved(pos, t))
 
         main_area_layout.addWidget(self.tabs, stretch=2)
 
@@ -342,15 +448,23 @@ class GoldBacktester(QMainWindow):
     def on_load_data(self):
         try:
             self.data_engine.load_data()
-            QMessageBox.information(self, "Success", "Data loaded successfully!")
+            self.status_label.setText("Data: Loaded")
+            self.status_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+            # If we just loaded a CSV (and feather doesn't exist yet), show convert
+            if not os.path.exists(self.data_engine.feather_path):
+                self.convert_btn.show()
         except Exception as e:
+            self.status_label.setText("Data: Error")
+            self.status_label.setStyleSheet("color: #c0392b; font-weight: bold;")
             QMessageBox.critical(self, "Error", f"Failed to load data: {str(e)}")
 
     @Slot()
     def on_convert_feather(self):
         try:
             self.data_engine.convert_to_feather()
-            QMessageBox.information(self, "Success", "Data converted to Feather format!")
+            self.convert_btn.hide()
+            self.status_label.setText("Data: Feather Ready")
+            self.status_label.setStyleSheet("color: #27ae60; font-weight: bold;")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Conversion failed: {str(e)}")
 
@@ -363,9 +477,12 @@ class GoldBacktester(QMainWindow):
             self.update_btn.setStyleSheet("background-color: #27ae60;")
 
             # Save to history if changed
-            if not self.code_history or self.code_history[-1] != code:
-                self.code_history.append(code)
-                self.history_list.addItem(f"Revision {len(self.code_history)} - {time.strftime('%H:%M:%S')}")
+            # Extract only the code from the tuples in self.code_history
+            if not self.code_history or self.code_history[-1][1] != code:
+                timestamp = time.strftime('%H:%M:%S')
+                self.code_history.append((timestamp, code))
+                self.history_list.addItem(f"Revision {len(self.code_history)} - {timestamp}")
+                self.save_settings() # Persist history change
         except Exception as e:
             self.backtest_btn.setEnabled(False)
             self.update_btn.setStyleSheet("background-color: #c0392b;")
@@ -374,9 +491,28 @@ class GoldBacktester(QMainWindow):
     def on_history_select(self, item):
         idx = self.history_list.row(item)
         if 0 <= idx < len(self.code_history):
-            self.code_editor.setPlainText(self.code_history[idx])
+            self.code_editor.setPlainText(self.code_history[idx][1])
             self.backtest_btn.setEnabled(False)
             self.update_btn.setStyleSheet("")
+
+    def on_history_context_menu(self, pos):
+        item = self.history_list.itemAt(pos)
+        if item:
+            menu = QMenu()
+            delete_action = menu.addAction("Delete Entry")
+            action = menu.exec(self.history_list.mapToGlobal(pos))
+            if action == delete_action:
+                idx = self.history_list.row(item)
+                self.code_history.pop(idx)
+                self.history_list.takeItem(idx)
+
+                # Update revision numbers in display
+                for i in range(self.history_list.count()):
+                    list_item = self.history_list.item(i)
+                    timestamp = self.code_history[i][0]
+                    list_item.setText(f"Revision {i+1} - {timestamp}")
+
+                self.save_settings()
 
     @Slot()
     def on_start_backtest(self):
@@ -390,7 +526,14 @@ class GoldBacktester(QMainWindow):
 
         # Reset plots
         for tf in self.active_timeframes:
-            self.plot_data[tf] = {'indices': [], 'actuals': [], 'predicts_x': [], 'predicts_y': []}
+            self.plot_data[tf] = {
+                'indices': [],
+                'actuals': [],
+                'predicts_x': [],
+                'predicts_y': [],
+                'colors': [],
+                'success_count': 0
+            }
             self.plot_items[tf].setData([], [])
             self.predict_items[tf].setData([], [])
             self.rate_labels[tf].setText("Success Rate: 0.00%")
@@ -415,28 +558,29 @@ class GoldBacktester(QMainWindow):
 
         self.backtest_btn.setEnabled(False)
 
-    @Slot(str, int, float, float, bool)
-    def update_plot(self, tf, idx, actual, predicted, is_success):
+    @Slot(str, float, float, float, bool)
+    def update_plot(self, tf, ts, actual, predicted, is_success):
         d = self.plot_data[tf]
-        d['indices'].append(idx)
+        d['indices'].append(ts)
         d['actuals'].append(actual)
-        d['predicts_x'].append(idx)
+        d['predicts_x'].append(ts)
         d['predicts_y'].append(predicted)
 
-        # Batch updates for performance? pyqtgraph is fast but let's see.
-        # Requirement: "don't redraw the whole graph every step. Use plotDataItem.setData() to append only the new points"
-        # Actually setData() replaces the data. To append we'd need something else, but setData with full array is usually fine.
-        # If it's slow, we update every N steps.
+        # Color code: Green for success, Red for failure
+        color = '#27ae60' if is_success else '#e74c3c'
+        d['colors'].append(pg.mkBrush(color))
+
+        if is_success:
+            d['success_count'] += 1
 
         if len(d['indices']) % 10 == 0: # Update every 10 points for smoother UI
             self.plot_items[tf].setData(d['indices'], d['actuals'])
-            self.predict_items[tf].setData(d['predicts_x'], d['predicts_y'])
-
-            # Calculate success rate so far
-            # We'd need to track success count too. Let's simplify and just show it at end or track it.
-            # Let's track it in plot_data
-            if 'success_count' not in d: d['success_count'] = 0
-            if is_success: d['success_count'] += 1
+            # Pass a copy of the colors list to avoid pyqtgraph internal size mismatch crashes
+            self.predict_items[tf].setData(
+                x=d['predicts_x'],
+                y=d['predicts_y'],
+                symbolBrush=list(d['colors'])
+            )
 
             rate = (d['success_count'] / len(d['indices']) * 100)
             self.rate_labels[tf].setText(f"Success Rate: {rate:.2f}%")
@@ -470,6 +614,66 @@ class GoldBacktester(QMainWindow):
             worker.wait()
         self.workers.clear()
         self.backtest_btn.setEnabled(True)
+
+    def on_mouse_moved(self, pos, tf):
+        """
+        Handles mouse hover to show tooltips with Actual vs Predicted values.
+        """
+        if tf not in self.plot_data or not self.plot_data[tf]['indices']:
+            return
+
+        components = self.plot_components.get(tf)
+        if not components:
+            return
+
+        vb = components['vb']
+        if vb.sceneBoundingRect().contains(pos):
+            mousePoint = vb.mapSceneToView(pos)
+            timestamp = mousePoint.x()
+
+            # Find the closest index in our data
+            indices = self.plot_data[tf]['indices']
+            actuals = self.plot_data[tf]['actuals']
+            predicts_y = self.plot_data[tf]['predicts_y']
+
+            if not indices:
+                return
+
+            # Find closest timestamp using binary search
+            import bisect
+            idx_pos = bisect.bisect_left(indices, timestamp)
+
+            if 0 <= idx_pos < len(indices):
+                actual_ts = indices[idx_pos]
+                actual_val = actuals[idx_pos]
+                pred_val = predicts_y[idx_pos]
+
+                # Update crosshair
+                components['vLine'].setPos(actual_ts)
+                components['hLine'].setPos(actual_val)
+
+                # Update tooltip text
+                # Convert timestamp to human readable date
+                time_str = pd.to_datetime(actual_ts, unit='s').strftime('%Y-%m-%d %H:%M')
+                text = f"<span style='color: white'>Time: {time_str}</span><br>"
+                text += f"<span style='color: #3498db'>Actual: {actual_val:.2f}</span><br>"
+                text += f"<span style='color: #e74c3c'>Predicted: {pred_val:.2f}</span><br>"
+                text += f"<span style='color: #27ae60'>Diff: {abs(actual_val - pred_val):.2f}</span>"
+
+                components['label'].setHtml(text)
+                components['label'].setPos(actual_ts, actual_val)
+
+                components['vLine'].show()
+                components['hLine'].show()
+                components['label'].show()
+            else:
+                components['vLine'].hide()
+                components['hLine'].hide()
+                components['label'].hide()
+        else:
+            components['vLine'].hide()
+            components['hLine'].hide()
+            components['label'].hide()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
