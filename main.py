@@ -29,12 +29,13 @@ class BacktestWorker(QThread):
     error = Signal(str)
     aborted = Signal(str, str)
 
-    def __init__(self, data, predict_code, timeframe, thresholds, abort_range):
+    def __init__(self, data, predict_code, timeframe, thresholds, toggles, abort_range):
         super().__init__()
         self.data = data
         self.predict_code = predict_code
         self.timeframe = timeframe
         self.thresholds = thresholds
+        self.toggles = toggles # {'up': bool, 'down': bool}
         self.abort_range = abort_range
         self._is_running = True
 
@@ -87,11 +88,17 @@ class BacktestWorker(QThread):
                 is_success = False
                 diff = abs(predicted - actual)
                 if actual >= prev_close: # Up/Flat
-                    if diff <= self.thresholds['up']:
-                        is_success = True
+                    if self.toggles['up']:
+                        if diff <= self.thresholds['up']:
+                            is_success = True
+                    else:
+                        is_success = True # Ignore threshold if disabled
                 else: # Down
-                    if diff <= self.thresholds['down']:
-                        is_success = True
+                    if self.toggles['down']:
+                        if diff <= self.thresholds['down']:
+                            is_success = True
+                    else:
+                        is_success = True # Ignore threshold if disabled
 
                 if is_success:
                     success_count += 1
@@ -159,6 +166,8 @@ class GoldBacktester(QMainWindow):
         # Save thresholds and other UI states
         self.settings.setValue("up_thresh", self.up_thresh.text())
         self.settings.setValue("down_thresh", self.down_thresh.text())
+        self.settings.setValue("up_toggle", self.up_toggle.isChecked())
+        self.settings.setValue("down_toggle", self.down_toggle.isChecked())
         self.settings.setValue("abort_thresh", self.abort_thresh.text())
         self.settings.setValue("active_tab", self.tabs.currentIndex())
         self.settings.setValue("current_code", self.code_editor.toPlainText())
@@ -173,6 +182,13 @@ class GoldBacktester(QMainWindow):
     def load_settings(self):
         self.up_thresh.setText(self.settings.value("up_thresh", "10.0"))
         self.down_thresh.setText(self.settings.value("down_thresh", "2.0"))
+
+        # Load toggles
+        up_toggle = self.settings.value("up_toggle", "true")
+        self.up_toggle.setChecked(str(up_toggle).lower() == 'true')
+        down_toggle = self.settings.value("down_toggle", "true")
+        self.down_toggle.setChecked(str(down_toggle).lower() == 'true')
+
         self.abort_thresh.setText(self.settings.value("abort_thresh", "100.0"))
 
         active_tab = self.settings.value("active_tab", 0)
@@ -248,14 +264,35 @@ class GoldBacktester(QMainWindow):
 
         # Thresholds
         thresh_group = QGroupBox("Success Thresholds")
-        thresh_form = QFormLayout()
+        thresh_layout = QVBoxLayout()
+
+        # Up Thresh Row
+        up_hbox = QHBoxLayout()
+        self.up_toggle = QCheckBox("Up Move (<=):")
+        self.up_toggle.setChecked(True)
         self.up_thresh = QLineEdit("10.0")
+        up_hbox.addWidget(self.up_toggle)
+        up_hbox.addWidget(self.up_thresh)
+
+        # Down Thresh Row
+        down_hbox = QHBoxLayout()
+        self.down_toggle = QCheckBox("Down Move (<=):")
+        self.down_toggle.setChecked(True)
         self.down_thresh = QLineEdit("2.0")
+        down_hbox.addWidget(self.down_toggle)
+        down_hbox.addWidget(self.down_thresh)
+
+        # Abort Thresh Row
+        abort_hbox = QHBoxLayout()
+        abort_label = QLabel("Auto-Abort (>):")
         self.abort_thresh = QLineEdit("100.0")
-        thresh_form.addRow("Up Move (<=):", self.up_thresh)
-        thresh_form.addRow("Down Move (<=):", self.down_thresh)
-        thresh_form.addRow("Auto-Abort (>):", self.abort_thresh)
-        thresh_group.setLayout(thresh_form)
+        abort_hbox.addWidget(abort_label)
+        abort_hbox.addWidget(self.abort_thresh)
+
+        thresh_layout.addLayout(up_hbox)
+        thresh_layout.addLayout(down_hbox)
+        thresh_layout.addLayout(abort_hbox)
+        thresh_group.setLayout(thresh_layout)
         sidebar_layout.addWidget(thresh_group)
 
         # History
@@ -479,7 +516,7 @@ class GoldBacktester(QMainWindow):
             # Save to history if changed
             # Extract only the code from the tuples in self.code_history
             if not self.code_history or self.code_history[-1][1] != code:
-                timestamp = time.strftime('%H:%M:%S')
+                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
                 self.code_history.append((timestamp, code))
                 self.history_list.addItem(f"Revision {len(self.code_history)} - {timestamp}")
                 self.save_settings() # Persist history change
@@ -543,11 +580,15 @@ class GoldBacktester(QMainWindow):
             'up': float(self.up_thresh.text()),
             'down': float(self.down_thresh.text())
         }
+        toggles = {
+            'up': self.up_toggle.isChecked(),
+            'down': self.down_toggle.isChecked()
+        }
         abort_range = float(self.abort_thresh.text())
 
         for tf in self.active_timeframes:
             df_tf = self.data_engine.get_resampled_data(tf)
-            worker = BacktestWorker(df_tf, code, tf, thresholds, abort_range)
+            worker = BacktestWorker(df_tf, code, tf, thresholds, toggles, abort_range)
             worker.progress.connect(self.update_plot)
             worker.finished.connect(self.on_worker_finished)
             worker.error.connect(self.on_worker_error)
