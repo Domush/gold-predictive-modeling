@@ -1,4 +1,5 @@
 # Gold Futures Backtester Pro
+<img width="1961" height="1400" alt="image" src="https://github.com/user-attachments/assets/37f42abb-cdfd-4a46-9dc7-4d6915bef0a4" />
 
 A modern, elegant desktop application for backtesting predictive Python functions on historical gold futures prices.
 
