@@ -15,35 +15,41 @@ A modern, elegant desktop application for backtesting predictive Python function
 ## Installation
 
 1. Clone the repository:
-   ```bash
-   git clone https://github.com/gold-predictive-modeling.git
-   cd gold-predictive-modeling
-   ```
 
-2. Install dependencies:
-   ```bash
-   pip install pyside6 pyqtgraph pandas numpy pygments feather-format
-   ```
+```bash
+git clone https://github.com/gold-predictive-modeling.git
+cd gold-predictive-modeling
+```
 
-3. Ensure the data file exists at `data/XAU_1m_data.csv`.
+1. Install dependencies:
+
+```bash
+pip install pyside6 pyqtgraph pandas numpy pygments feather-format
+```
+
+1. Ensure the data file exists at `data/XAU_1m_data.csv`.
 
 ## Usage
 
 1. Run the application:
-   ```bash
-   python main.py
-   ```
-2. Select the desired timeframes in the sidebar.
-3. Write or edit your predictive function in the editor. The function must follow the signature:
-   ```python
-   def predict(ohlcv_data):
-       # ohlcv_data is a numpy array of the last 10 rows
-       # returns a predicted price (float)
-       pass
-   ```
-4. Click **Update / Validate** to check for syntax errors.
-5. Click **Start Backtest** to begin.
-6. Use the **Stop** button to halt a running backtest.
+
+```bash
+python main.py
+```
+
+1. Select the desired timeframes in the sidebar.
+2. Write or edit your predictive function in the editor. The function must follow the signature:
+
+```python
+def predict(ohlcv_data):
+      # ohlcv_data is a numpy array of the last 10 rows
+      # returns a predicted price (float)
+      pass
+```
+
+1. Click **Update / Validate** to check for syntax errors.
+2. Click **Start Backtest** to begin.
+3. Use the **Stop** button to halt a running backtest.
 
 ## UI Controls
 

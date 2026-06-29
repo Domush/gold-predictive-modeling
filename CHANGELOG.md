@@ -8,12 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.0.1] - 2026-02-12
 
 ### Changed
+
 - Improved UI responsiveness by disabling the Stop button when no backtest is running (specifically when the 'Start Backtest' button is enabled).
 - Enhanced button state management across code validation, history selection, and backtest execution.
 
 ## [1.0.0] - 2026-02-12
 
 ### Added
+
 - Initial release of Gold Futures Backtester Pro.
 - Support for multiple timeframes (1m to 1d).
 - Real-time plotting with pyqtgraph.

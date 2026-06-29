@@ -6,6 +6,7 @@ os.environ['QT_API'] = 'pyside6'
 
 import time
 import traceback
+import math
 import pandas as pd
 import numpy as np
 import PySide6 # Import PySide6 before pyqtgraph
@@ -14,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTabWidget, QPushButton, QLabel,
                              QPlainTextEdit, QLineEdit, QFormLayout, QGroupBox,
                              QListWidget, QSplitter, QMessageBox, QCheckBox,
-                             QMenu, QSlider, QFileDialog)
+                             QMenu, QSlider, QFileDialog, QSpinBox)
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QSettings, QTimer
 from PySide6.QtGui import QFont, QColor
 
@@ -90,13 +91,14 @@ class RangeSlider(QWidget):
 
 # --- Worker Thread ---
 class BacktestWorker(QThread):
-    # Signals: timeframe, timestamp, actual, predicted, is_success
-    progress = Signal(str, float, float, float, bool)
+    # Signals: timeframe, timestamp, actual, predicted, confidence_pct, is_success, invested, account_value
+    progress = Signal(str, float, float, float, float, bool, float, float)
     finished = Signal(str, float)
     error = Signal(str)
     aborted = Signal(str, str)
+    abort_point = Signal(str, float, float)
 
-    def __init__(self, data, predict_code, timeframe, thresholds, toggles, abort_range):
+    def __init__(self, data, predict_code, timeframe, thresholds, toggles, abort_range, start_capital, leverage, max_position_value, sell_above_max, prediction_offset, confidence_offset):
         super().__init__()
         self.data = data
         self.predict_code = predict_code
@@ -104,6 +106,17 @@ class BacktestWorker(QThread):
         self.thresholds = thresholds
         self.toggles = toggles # {'up': bool, 'down': bool}
         self.abort_range = abort_range
+        self.start_capital = start_capital
+        self.leverage = leverage
+        self.max_position_value = max_position_value
+        self.sell_above_max = sell_above_max
+        self.prediction_offset = prediction_offset
+        self.confidence_offset = confidence_offset
+        self.tick_value = 10.0
+        self.tick_size = 0.1
+        self.account_value = float(self.start_capital)
+        self.position = 0
+        self.entry_contracts = 0
         self._is_running = True
 
     def stop(self):
@@ -129,22 +142,38 @@ class BacktestWorker(QThread):
             success_count = 0
             total_count = 0
 
-            # Start from row 10
-            for i in range(10, len(self.data)):
+            # Start from row 100
+            if len(self.data) > 100:
+                start_idx = 99
+                start_ts = float(self.data.index[start_idx].timestamp())
+                start_actual = self.data.iloc[start_idx]['Close']
+                self.progress.emit(self.timeframe, start_ts, start_actual, start_actual, 0.0, False, 0.0, self.account_value)
+
+            for i in range(100, len(self.data)):
                 if not self._is_running:
                     break
 
-                window = self.data.iloc[i-10:i]
+                window = self.data.iloc[i-100:i]
                 actual = self.data.iloc[i]['Close']
                 ts = float(self.data.index[i].timestamp())
                 prev_close = self.data.iloc[i-1]['Close']
                 ohlcv_data = window[['Open', 'High', 'Low', 'Close', 'Volume']].values
 
                 try:
-                    predicted = predict_func(ohlcv_data)
+                    prediction_result = predict_func(ohlcv_data)
                 except Exception as e:
                     self.error.emit(f"Runtime error in prediction: {str(e)}")
                     return
+
+                if isinstance(prediction_result, tuple) and len(prediction_result) == 2:
+                    predicted, confidence_pct = prediction_result
+                else:
+                    self.error.emit("Predict function must return (prediction, confidence_pct).")
+                    return
+
+                predicted = float(predicted) + self.prediction_offset
+                confidence_pct = float(confidence_pct) + self.confidence_offset
+                confidence_pct = max(0.0, min(100.0, confidence_pct))
 
                 # Check for abort
                 if abs(predicted - actual) > self.abort_range:
@@ -171,19 +200,78 @@ class BacktestWorker(QThread):
                     success_count += 1
                 total_count += 1
 
-                # Emit update
-                self.progress.emit(self.timeframe, ts, actual, predicted, is_success)
+                # Account simulation: fixed tick futures contract, long-only.
+                contract_cost = 0.85 * prev_close
+                if self.position == 0:
+                    if self.account_value < contract_cost:
+                        self.abort_point.emit(self.timeframe, ts, self.account_value)
+                        self.aborted.emit(self.timeframe, f"Stopped: account value below one contract cost (${contract_cost:.2f})")
+                        return
+
+                    base_contracts = int(self.account_value // contract_cost)
+                    if confidence_pct >= 90.0:
+                        confidence_factor = 1.0
+                    elif confidence_pct >= 80.0:
+                        confidence_factor = 0.75
+                    elif confidence_pct >= 70.0:
+                        confidence_factor = 0.50
+                    elif confidence_pct >= 60.0:
+                        confidence_factor = 0.25
+                    else:
+                        confidence_factor = 0.0
+
+                    num_contracts = int(math.ceil(base_contracts * confidence_factor)) if confidence_factor > 0 else 0
+                    if self.max_position_value > 0:
+                        max_contracts = int(self.max_position_value // contract_cost)
+                        num_contracts = min(num_contracts, max_contracts)
+
+                    if predicted > prev_close and num_contracts > 0:
+                        self.position = 1
+                        self.entry_contracts = num_contracts
+                        invested_amount = self.entry_contracts * contract_cost
+                    else:
+                        invested_amount = 0.0
+                else:
+                    num_contracts = self.entry_contracts
+                    if self.max_position_value > 0 and self.sell_above_max:
+                        max_contracts = int(self.max_position_value // contract_cost)
+                        if num_contracts > max_contracts:
+                            num_contracts = max_contracts
+                            if num_contracts == 0:
+                                self.position = 0
+                                self.entry_contracts = 0
+                                invested_amount = 0.0
+                            else:
+                                self.entry_contracts = num_contracts
+                                invested_amount = num_contracts * contract_cost
+                        else:
+                            invested_amount = num_contracts * contract_cost if num_contracts > 0 else 0.0
+                    else:
+                        invested_amount = num_contracts * contract_cost if num_contracts > 0 else 0.0
+
+                    if predicted <= prev_close:
+                        self.position = 0
+                        self.entry_contracts = 0
+                        invested_amount = 0.0
+
+                ticks = (actual - prev_close) / self.tick_size
+                pnl = self.position * ticks * self.tick_value * num_contracts * self.leverage
+                self.account_value += pnl
+
+                self.progress.emit(self.timeframe, ts, actual, predicted, confidence_pct, is_success, invested_amount, self.account_value)
+
+                if self.position == 1 and self.account_value < contract_cost:
+                    self.abort_point.emit(self.timeframe, ts, self.account_value)
+                    self.aborted.emit(self.timeframe, f"Stopped: account value below one contract cost (${contract_cost:.2f})")
+                    return
 
                 # Dynamic delay based on total_count to keep the app responsive as data grows.
-                # As total_count increases, we increase the pause to give the GUI thread more time
-                # to process the increasingly heavy setData() calls.
+                # Increase the ramp-up significantly for longer interval runs (e.g. 11 days of 15m bars).
                 if i % 10 == 0:
-                    # Gradually increase sleep: 5ms base + 2ms per 50 points
-                    # This provides a more aggressive delay as data grows to keep the GUI responsive.
-                    dynamic_pause = 0.005 + (total_count / 50) * 0.002
+                    dynamic_pause = 0.02 + min(0.8, (total_count / 25.0) * 0.015)
                     time.sleep(dynamic_pause)
                 else:
-                    time.sleep(0.0001) # Increased from 0.00001 to give a bit more breathing room
+                    time.sleep(0.001)
 
             final_rate = (success_count / total_count * 100) if total_count > 0 else 0
             self.finished.emit(self.timeframe, final_rate)
@@ -205,6 +293,7 @@ class GoldBacktester(QMainWindow):
         self.timeframes = ['1m', '5m', '15m', '30m', '1h', '1d']
         self.active_timeframes = []
         self.plot_components = {}
+        self.account_plot_components = {}
 
         # Plot data storage
         self.plot_data = {tf: {
@@ -212,10 +301,31 @@ class GoldBacktester(QMainWindow):
             'actuals': [],
             'predicts_x': [],
             'predicts_y': [],
+            'confidences': [],
             'colors': [], # List of brush colors
             'successes': [], # List of bools
             'success_count': 0
         } for tf in self.timeframes}
+
+        self.account_data = {tf: {
+            'timestamps': [],
+            'invested': [],
+            'account_values': [],
+            'buy_timestamps': [],
+            'buy_values': [],
+            'sell_timestamps': [],
+            'sell_values': [],
+            'abort_timestamps': [],
+            'abort_values': [],
+            'last_account_value': None,
+            'last_invested': 0.0
+        } for tf in self.timeframes}
+
+        self.account_plot_items = {}
+        self.invested_plot_items = {}
+        self.buy_plot_items = {}
+        self.sell_plot_items = {}
+        self.abort_plot_items = {}
 
         self.init_ui()
         self.apply_dark_theme()
@@ -241,6 +351,12 @@ class GoldBacktester(QMainWindow):
         self.settings.setValue("up_toggle", self.up_toggle.isChecked())
         self.settings.setValue("down_toggle", self.down_toggle.isChecked())
         self.settings.setValue("abort_thresh", self.abort_thresh.text())
+        self.settings.setValue("prediction_offset", self.pred_offset_slider.value())
+        self.settings.setValue("confidence_offset", self.conf_offset_slider.value())
+        self.settings.setValue("start_capital", self.start_capital.text())
+        self.settings.setValue("leverage", self.leverage_input.value())
+        self.settings.setValue("max_position_value", self.max_position_value.text())
+        self.settings.setValue("sell_above_max", self.sell_above_max_checkbox.isChecked())
         self.settings.setValue("active_tab", self.tabs.currentIndex())
         self.settings.setValue("current_code", self.code_editor.toPlainText())
 
@@ -270,6 +386,18 @@ class GoldBacktester(QMainWindow):
         self.down_toggle.setChecked(str(down_toggle).lower() == 'true')
 
         self.abort_thresh.setText(self.settings.value("abort_thresh", "100.0"))
+        offset_value = int(self.settings.value("prediction_offset", 0))
+        self.pred_offset_slider.setValue(offset_value)
+        self.pred_offset_value.setText(f"{offset_value / 10:.1f}")
+        conf_offset_value = int(self.settings.value("confidence_offset", 0))
+        self.conf_offset_slider.setValue(conf_offset_value)
+        self.conf_offset_value.setText(str(conf_offset_value))
+        self.start_capital.setText(self.settings.value("start_capital", "10000"))
+        leverage = int(self.settings.value("leverage", 12))
+        self.leverage_input.setValue(leverage)
+        self.max_position_value.setText(self.settings.value("max_position_value", "0"))
+        sell_above_max = self.settings.value("sell_above_max", "false")
+        self.sell_above_max_checkbox.setChecked(str(sell_above_max).lower() == 'true')
 
         active_tab = self.settings.value("active_tab", 0)
         self.tabs.setCurrentIndex(int(active_tab))
@@ -298,6 +426,12 @@ class GoldBacktester(QMainWindow):
         # Load date range
         self.saved_start_date = self.settings.value("start_date", None)
         self.saved_end_date = self.settings.value("end_date", None)
+
+    def update_offset_label(self, value):
+        self.pred_offset_value.setText(f"{value / 10:.1f}")
+
+    def update_conf_offset_label(self, value):
+        self.conf_offset_value.setText(str(value))
 
     def init_ui(self):
         central_widget = QWidget()
@@ -371,7 +505,9 @@ class GoldBacktester(QMainWindow):
         up_hbox = QHBoxLayout()
         self.up_toggle = QCheckBox("Up Move (<=):")
         self.up_toggle.setChecked(True)
+        self.up_toggle.setToolTip("Enable upper success threshold for upward predictions.")
         self.up_thresh = QLineEdit("10.0")
+        self.up_thresh.setToolTip("Maximum allowed error for upward predictions to count as success.")
         up_hbox.addWidget(self.up_toggle)
         up_hbox.addWidget(self.up_thresh)
 
@@ -379,22 +515,100 @@ class GoldBacktester(QMainWindow):
         down_hbox = QHBoxLayout()
         self.down_toggle = QCheckBox("Down Move (<=):")
         self.down_toggle.setChecked(True)
+        self.down_toggle.setToolTip("Enable lower success threshold for downward predictions.")
         self.down_thresh = QLineEdit("2.0")
+        self.down_thresh.setToolTip("Maximum allowed error for downward predictions to count as success.")
         down_hbox.addWidget(self.down_toggle)
         down_hbox.addWidget(self.down_thresh)
 
         # Abort Thresh Row
         abort_hbox = QHBoxLayout()
         abort_label = QLabel("Auto-Abort (>):")
+        abort_label.setToolTip("Label for the auto-abort threshold.")
         self.abort_thresh = QLineEdit("100.0")
+        self.abort_thresh.setToolTip("Stop backtests when prediction error exceeds this value.")
         abort_hbox.addWidget(abort_label)
         abort_hbox.addWidget(self.abort_thresh)
+
+        # Prediction Offset Slider
+        offset_hbox = QHBoxLayout()
+        offset_label = QLabel("Pred Offset:")
+        offset_label.setToolTip("Offset the predicted value by a fixed amount.")
+        self.pred_offset_slider = QSlider(Qt.Horizontal)
+        self.pred_offset_slider.setRange(-100, 100)
+        self.pred_offset_slider.setValue(0)
+        self.pred_offset_slider.setTickInterval(10)
+        self.pred_offset_slider.setTickPosition(QSlider.TicksBelow)
+        self.pred_offset_slider.setSingleStep(1)
+        self.pred_offset_value = QLabel("0.0")
+        self.pred_offset_slider.valueChanged.connect(self.update_offset_label)
+        offset_hbox.addWidget(offset_label)
+        offset_hbox.addWidget(self.pred_offset_slider)
+        offset_hbox.addWidget(self.pred_offset_value)
+
+        conf_offset_hbox = QHBoxLayout()
+        conf_offset_label = QLabel("Conf Offset:")
+        conf_offset_label.setToolTip("Offset the confidence percentage by a fixed amount.")
+        self.conf_offset_slider = QSlider(Qt.Horizontal)
+        self.conf_offset_slider.setRange(-80, 80)
+        self.conf_offset_slider.setValue(0)
+        self.conf_offset_slider.setTickInterval(5)
+        self.conf_offset_slider.setTickPosition(QSlider.TicksBelow)
+        self.conf_offset_slider.setSingleStep(1)
+        self.conf_offset_slider.setPageStep(5)
+        self.conf_offset_slider.setTracking(True)
+        self.conf_offset_value = QLabel("0")
+        self.conf_offset_slider.valueChanged.connect(self.update_conf_offset_label)
+        conf_offset_hbox.addWidget(conf_offset_label)
+        conf_offset_hbox.addWidget(self.conf_offset_slider)
+        conf_offset_hbox.addWidget(self.conf_offset_value)
 
         thresh_layout.addLayout(up_hbox)
         thresh_layout.addLayout(down_hbox)
         thresh_layout.addLayout(abort_hbox)
+        thresh_layout.addLayout(offset_hbox)
+        thresh_layout.addLayout(conf_offset_hbox)
         thresh_group.setLayout(thresh_layout)
         sidebar_layout.addWidget(thresh_group)
+
+        # Futures Account
+        account_group = QGroupBox("Futures Account")
+        account_layout = QVBoxLayout()
+
+        start_hbox = QHBoxLayout()
+        self.start_capital = QLineEdit("10000")
+        self.start_capital.setPlaceholderText("Starting Capital")
+        start_label = QLabel("Start Capital:")
+        start_hbox.addWidget(start_label)
+        start_hbox.addWidget(self.start_capital)
+
+        leverage_hbox = QHBoxLayout()
+        self.leverage_input = QSpinBox()
+        self.leverage_input.setRange(1, 50)
+        self.leverage_input.setValue(12)
+        self.leverage_input.setSuffix("x")
+        leverage_label = QLabel("Leverage:")
+        leverage_hbox.addWidget(leverage_label)
+        leverage_hbox.addWidget(self.leverage_input)
+
+        maxpos_hbox = QHBoxLayout()
+        self.max_position_value = QLineEdit("0")
+        self.max_position_value.setPlaceholderText("Max Position Value")
+        self.max_position_value.setToolTip("Maximum notional position size before forced reduction.")
+        maxpos_label = QLabel("Max Position:")
+        maxpos_hbox.addWidget(maxpos_label)
+        maxpos_hbox.addWidget(self.max_position_value)
+
+        self.sell_above_max_checkbox = QCheckBox("Sell positions above max value")
+        self.sell_above_max_checkbox.setChecked(False)
+        self.sell_above_max_checkbox.setToolTip("If checked, positions above max value will be sold down to the limit.")
+
+        account_layout.addLayout(start_hbox)
+        account_layout.addLayout(leverage_hbox)
+        account_layout.addLayout(maxpos_hbox)
+        account_layout.addWidget(self.sell_above_max_checkbox)
+        account_group.setLayout(account_layout)
+        sidebar_layout.addWidget(account_group)
 
         # History
         hist_group = QGroupBox("Code History")
@@ -450,18 +664,32 @@ class GoldBacktester(QMainWindow):
             self.plot_items[tf] = pw.plot(pen=pg.mkPen(color='#3498db', width=1.5), name="Actual")
             self.predict_items[tf] = pw.plot(pen=None, symbol='o', symbolSize=6, symbolBrush='#e74c3c', name="Predicted")
 
-            # Create crosshair lines
+            account_axis = pg.DateAxisItem(orientation='bottom')
+            account_pw = pg.PlotWidget(title=f"Account Metrics - {tf}", axisItems={'bottom': account_axis})
+            account_pw.setBackground('#121212')
+            account_pw.showGrid(x=True, y=True, alpha=0.3)
+            account_pw.addLegend()
+            # Keep the account chart x-axis aligned with the main price chart.
+            account_pw.setXLink(pw)
+            self.account_plot_items[tf] = account_pw.plot(pen=pg.mkPen(color='#f1c40f', width=2, style=Qt.DashLine), name="Account Value")
+            self.invested_plot_items[tf] = account_pw.plot(pen=pg.mkPen(color='#8e44ad', width=1, style=Qt.DotLine), name="Invested")
+            self.buy_plot_items[tf] = account_pw.plot(pen=None, symbol='o', symbolSize=10, symbolBrush='#2ecc71', name='Buy')
+            self.sell_plot_items[tf] = account_pw.plot(pen=None, symbol='o', symbolSize=10, symbolBrush='#e74c3c', name='Sell')
+            self.abort_plot_items[tf] = account_pw.plot(pen=None, symbol='x', symbolSize=14, symbolBrush='#ff0000', name='Abort')
+            tab_layout.addWidget(account_pw)
+
+            # Create crosshair lines for main price plot
             vLine = pg.InfiniteLine(angle=90, movable=False, pen='#666')
             hLine = pg.InfiniteLine(angle=0, movable=False, pen='#666')
             pw.addItem(vLine, ignoreBounds=True)
             pw.addItem(hLine, ignoreBounds=True)
 
-            # Text item for tooltip-like display
+            # Text item for main plot tooltip
             label = pg.TextItem(anchor=(0, 1), color='#fff', fill='#333', border='#555')
             label.setZValue(100)
             pw.addItem(label, ignoreBounds=True)
 
-            # Store components for hover logic
+            # Store components for main plot hover logic
             self.plot_components[tf] = {
                 'vLine': vLine,
                 'hLine': hLine,
@@ -469,8 +697,26 @@ class GoldBacktester(QMainWindow):
                 'vb': pw.getViewBox()
             }
 
-            # Connect hover signal using a lambda to pass the timeframe
+            # Create crosshair lines for account chart
+            account_vLine = pg.InfiniteLine(angle=90, movable=False, pen='#666')
+            account_hLine = pg.InfiniteLine(angle=0, movable=False, pen='#666')
+            account_pw.addItem(account_vLine, ignoreBounds=True)
+            account_pw.addItem(account_hLine, ignoreBounds=True)
+
+            account_label = pg.TextItem(anchor=(0, 1), color='#fff', fill='#333', border='#555')
+            account_label.setZValue(100)
+            account_pw.addItem(account_label, ignoreBounds=True)
+
+            self.account_plot_components[tf] = {
+                'vLine': account_vLine,
+                'hLine': account_hLine,
+                'label': account_label,
+                'vb': account_pw.getViewBox()
+            }
+
+            # Connect hover signals using lambdas to pass the timeframe
             pw.scene().sigMouseMoved.connect(lambda pos, t=tf: self.on_mouse_moved(pos, t))
+            account_pw.scene().sigMouseMoved.connect(lambda pos, t=tf: self.on_account_mouse_moved(pos, t))
 
         main_area_layout.addWidget(self.tabs, stretch=2)
 
@@ -564,7 +810,7 @@ class GoldBacktester(QMainWindow):
 
     def load_initial_code(self):
         try:
-            with open("ai_studio_code_1_10.py", "r") as f:
+            with open("prediction_v1.py", "r") as f:
                 content = f.read()
 
             # The requirement is def predict(ohlcv_data).
@@ -737,6 +983,7 @@ class GoldBacktester(QMainWindow):
                 'actuals': [],
                 'predicts_x': [],
                 'predicts_y': [],
+                'confidences': [],
                 'colors': [],
                 'successes': [],
                 'success_count': 0
@@ -769,7 +1016,36 @@ class GoldBacktester(QMainWindow):
             start_dt = self.data_engine.df.index.min()
             end_dt = self.data_engine.df.index.max()
 
+        start_capital = float(self.start_capital.text())
+        leverage = float(self.leverage_input.value())
+        max_position_value = float(self.max_position_value.text()) if self.max_position_value.text().strip() else 0.0
+        sell_above_max = self.sell_above_max_checkbox.isChecked()
+        prediction_offset = self.pred_offset_slider.value() / 10.0
+        confidence_offset = self.conf_offset_slider.value()
+
         for tf in self.active_timeframes:
+            self.account_data[tf] = {
+                'timestamps': [],
+                'invested': [],
+                'account_values': [],
+                'buy_timestamps': [],
+                'buy_values': [],
+                'sell_timestamps': [],
+                'sell_values': [],
+                'abort_timestamps': [],
+                'abort_values': [],
+                'final_timestamp': None,
+                'final_account_value': None,
+                'final_invested': None,
+                'last_account_value': None,
+                'last_invested': 0.0
+            }
+            self.account_plot_items[tf].setData([], [])
+            self.invested_plot_items[tf].setData([], [])
+            self.buy_plot_items[tf].setData([], [])
+            self.sell_plot_items[tf].setData([], [])
+            self.abort_plot_items[tf].setData([], [])
+
             df_tf = self.data_engine.get_resampled_data(tf)
 
             # Filter by date range
@@ -779,11 +1055,12 @@ class GoldBacktester(QMainWindow):
                 self.rate_labels[tf].setText("Insufficient Data")
                 continue
 
-            worker = BacktestWorker(df_tf, code, tf, thresholds, toggles, abort_range)
+            worker = BacktestWorker(df_tf, code, tf, thresholds, toggles, abort_range, start_capital, leverage, max_position_value, sell_above_max, prediction_offset, confidence_offset)
             worker.progress.connect(self.update_plot)
             worker.finished.connect(self.on_worker_finished)
             worker.error.connect(self.on_worker_error)
             worker.aborted.connect(self.on_worker_aborted)
+            worker.abort_point.connect(self.on_abort_point)
 
             self.workers[tf] = worker
             worker.start()
@@ -791,14 +1068,41 @@ class GoldBacktester(QMainWindow):
         self.backtest_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
-    @Slot(str, float, float, float, bool)
-    def update_plot(self, tf, ts, actual, predicted, is_success):
+    @Slot(str, float, float, float, float, bool, float, float)
+    def update_plot(self, tf, ts, actual, predicted, confidence_pct, is_success, invested_amount, account_value):
         d = self.plot_data[tf]
+        previous_ts = d['indices'][-1] if d['indices'] else ts
         d['indices'].append(ts)
         d['actuals'].append(actual)
         d['predicts_x'].append(ts)
         d['predicts_y'].append(predicted)
+        d['confidences'].append(confidence_pct)
         d['successes'].append(is_success)
+
+        acc = self.account_data[tf]
+        prev_invested = acc['last_invested'] if acc['last_invested'] is not None else 0.0
+        plot_account_value = acc['last_account_value'] if acc['last_account_value'] is not None else account_value
+        plot_invested = acc['last_invested'] if acc['last_invested'] is not None else invested_amount
+
+        shift_seconds = self._get_account_shift_seconds(tf)
+        shifted_ts = ts + shift_seconds
+
+        acc['timestamps'].append(shifted_ts)
+        acc['invested'].append(plot_invested)
+        acc['account_values'].append(plot_account_value)
+
+        if invested_amount > 0 and prev_invested == 0.0:
+            acc['buy_timestamps'].append(shifted_ts)
+            acc['buy_values'].append(plot_account_value)
+        elif invested_amount == 0.0 and prev_invested > 0.0:
+            acc['sell_timestamps'].append(shifted_ts)
+            acc['sell_values'].append(plot_account_value)
+
+        acc['last_account_value'] = account_value
+        acc['last_invested'] = invested_amount
+        acc['final_timestamp'] = ts
+        acc['final_account_value'] = account_value
+        acc['final_invested'] = invested_amount
 
         # Color code: Green for success, Red for failure
         color = '#27ae60' if is_success else '#e74c3c'
@@ -807,21 +1111,47 @@ class GoldBacktester(QMainWindow):
         if is_success:
             d['success_count'] += 1
 
-        if len(d['indices']) % 10 == 0: # Update every 10 points for smoother UI
-            self.plot_items[tf].setData(d['indices'], d['actuals'])
-            # Pass a copy of the colors list to avoid pyqtgraph internal size mismatch crashes
+        self.plot_items[tf].setData(d['indices'], d['actuals'])
+        # For larger backtests, avoid rendering a scatter symbol for every predicted point.
+        if len(d['indices']) > 5000:
             self.predict_items[tf].setData(
                 x=d['predicts_x'],
                 y=d['predicts_y'],
+                pen=pg.mkPen(color='#e74c3c', width=1),
+                symbol=None
+            )
+        else:
+            self.predict_items[tf].setData(
+                x=d['predicts_x'],
+                y=d['predicts_y'],
+                symbol='o',
                 symbolBrush=list(d['colors'])
             )
 
-            rate = (d['success_count'] / len(d['indices']) * 100)
-            self.rate_labels[tf].setText(f"Success Rate: {rate:.2f}%")
+        final_ts = acc['final_timestamp']
+        account_timestamps = list(acc['timestamps'])
+        account_values = list(acc['account_values'])
+        invested_values = list(acc['invested'])
+        if final_ts is not None:
+            account_timestamps.append(final_ts)
+            account_values.append(acc['final_account_value'])
+            invested_values.append(acc['final_invested'])
+
+        self.account_plot_items[tf].setData(account_timestamps, account_values)
+        self.invested_plot_items[tf].setData(account_timestamps, invested_values)
+        self.buy_plot_items[tf].setData(acc['buy_timestamps'], acc['buy_values'])
+        self.sell_plot_items[tf].setData(acc['sell_timestamps'], acc['sell_values'])
+        self.abort_plot_items[tf].setData(acc['abort_timestamps'], acc['abort_values'])
+
+        rate = (d['success_count'] / len(d['indices']) * 100)
+        self.rate_labels[tf].setText(f"Success Rate: {rate:.2f}% | Account: ${account_value:,.2f}")
 
     @Slot(str, float)
     def on_worker_finished(self, tf, rate):
-        self.rate_labels[tf].setText(f"FINAL Success Rate: {rate:.2f}%")
+        final_value = 0.0
+        if tf in self.account_data and self.account_data[tf]['account_values']:
+            final_value = self.account_data[tf]['account_values'][-1]
+        self.rate_labels[tf].setText(f"FINAL Success Rate: {rate:.2f}% | Final Account: ${final_value:,.2f}")
         if tf in self.workers:
             del self.workers[tf]
         if not self.workers:
@@ -843,6 +1173,16 @@ class GoldBacktester(QMainWindow):
             self.backtest_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
 
+    @Slot(str, float, float)
+    def on_abort_point(self, tf, ts, account_value):
+        acc = self.account_data.get(tf)
+        if acc is None:
+            return
+        # Abort should show at the actual final tick, not on the shifted account series.
+        acc['abort_timestamps'].append(ts)
+        acc['abort_values'].append(account_value)
+        self.abort_plot_items[tf].setData(acc['abort_timestamps'], acc['abort_values'])
+
     @Slot()
     def on_stop_backtest(self):
         for tf, worker in self.workers.items():
@@ -852,103 +1192,192 @@ class GoldBacktester(QMainWindow):
         self.backtest_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
-    def on_mouse_moved(self, pos, tf):
-        """
-        Handles mouse hover to show tooltips with Actual vs Predicted values.
-        """
+    def _get_closest_index(self, indices, timestamp):
+        import bisect
+        idx_pos = bisect.bisect_left(indices, timestamp)
+        if idx_pos == 0:
+            return 0
+        if idx_pos == len(indices):
+            return len(indices) - 1
+
+        left_dist = abs(timestamp - indices[idx_pos - 1])
+        right_dist = abs(indices[idx_pos] - timestamp)
+        return idx_pos - 1 if left_dist < right_dist else idx_pos
+
+    def _get_account_shift_seconds(self, tf):
+        # Shift account chart data one full timeframe interval to the left.
+        if tf == '1m':
+            return -60
+        if tf == '5m':
+            return -300
+        if tf == '15m':
+            return -900
+        if tf == '30m':
+            return -1800
+        if tf == '1h':
+            return -3600
+        if tf == '1d':
+            return -86400
+        return -60
+
+    def _hide_tooltips(self, tf):
+        for components in (self.plot_components.get(tf), self.account_plot_components.get(tf)):
+            if components:
+                components['vLine'].hide()
+                components['hLine'].hide()
+                components['label'].hide()
+
+    def _sync_tooltips(self, tf, timestamp, source='main'):
         if tf not in self.plot_data or not self.plot_data[tf]['indices']:
+            self._hide_tooltips(tf)
+            return
+        if tf not in self.account_data or not self.account_data[tf]['timestamps']:
+            self._hide_tooltips(tf)
+            return
+
+        if source == 'account':
+            account_timestamps = list(self.account_data[tf]['timestamps'])
+            account_values = list(self.account_data[tf]['account_values'])
+            invested_values = list(self.account_data[tf]['invested'])
+            final_ts = self.account_data[tf].get('final_timestamp')
+            if final_ts is not None:
+                account_timestamps.append(final_ts)
+                account_values.append(self.account_data[tf].get('final_account_value', account_values[-1] if account_values else 0.0))
+                invested_values.append(self.account_data[tf].get('final_invested', invested_values[-1] if invested_values else 0.0))
+
+            closest_account_idx = self._get_closest_index(account_timestamps, timestamp)
+            if closest_account_idx < 0 or closest_account_idx >= len(account_timestamps):
+                self._hide_tooltips(tf)
+                return
+
+            indices = self.plot_data[tf]['indices']
+            price_idx = max(0, closest_account_idx - 1)
+            actual_ts = account_timestamps[closest_account_idx]
+            account_val = account_values[closest_account_idx]
+            invested_val = invested_values[closest_account_idx]
+            prev_account_val = account_values[closest_account_idx - 1] if closest_account_idx > 0 else account_val
+            delta = account_val - prev_account_val
+        else:
+            account_timestamps = list(self.account_data[tf]['timestamps'])
+            account_values = list(self.account_data[tf]['account_values'])
+            invested_values = list(self.account_data[tf]['invested'])
+            final_ts = self.account_data[tf].get('final_timestamp')
+            if final_ts is not None:
+                account_timestamps.append(final_ts)
+                account_values.append(self.account_data[tf].get('final_account_value', account_values[-1] if account_values else 0.0))
+                invested_values.append(self.account_data[tf].get('final_invested', invested_values[-1] if invested_values else 0.0))
+
+            indices = self.plot_data[tf]['indices']
+            closest_account_idx = self._get_closest_index(account_timestamps, timestamp)
+            closest_idx = self._get_closest_index(indices, timestamp)
+            if closest_idx < 0 or closest_idx >= len(indices):
+                self._hide_tooltips(tf)
+                return
+
+            actual_ts = indices[closest_idx]
+            account_val = account_values[closest_account_idx] if closest_account_idx < len(account_values) else account_values[-1]
+            invested_val = invested_values[closest_account_idx] if closest_account_idx < len(invested_values) else invested_values[-1]
+            prev_account_val = account_values[closest_account_idx - 1] if closest_account_idx > 0 else account_val
+            delta = account_val - prev_account_val
+
+            price_idx = closest_idx
+
+        actuals = self.plot_data[tf]['actuals']
+        predicts_y = self.plot_data[tf]['predicts_y']
+        confidences = self.plot_data[tf]['confidences']
+        successes = self.plot_data[tf]['successes']
+
+        actual_val = actuals[price_idx]
+        pred_val = predicts_y[price_idx]
+        confidence_pct = confidences[price_idx]
+        is_success = successes[price_idx]
+        prev_actual = actuals[price_idx - 1] if price_idx > 0 else actual_val
+        pred_change = pred_val - prev_actual
+        actual_change = actual_val - prev_actual
+        diff = pred_val - actual_val
+
+        def get_color(val):
+            return "#27ae60" if val >= 0 else "#e74c3c"
+
+        time_str = pd.to_datetime(actual_ts, unit='s').strftime('%Y-%m-%d %H:%M')
+
+        main_text = f"<span style='color: white'>{time_str}</span><br>"
+        main_text += f"<span style='color: white'>P: {pred_val:.2f} </span>"
+        main_text += f"<span style='color: {get_color(pred_change)}'>({pred_change:+.2f})</span><br>"
+        main_text += f"<span style='color: white'>A: {actual_val:.2f} </span>"
+        main_text += f"<span style='color: {get_color(actual_change)}'>({actual_change:+.2f})</span><br>"
+        main_text += f"<span style='color: white'>Conf: {confidence_pct:.1f}%</span><br>"
+        main_text += f"<span style='color: white'>≅: </span>"
+        main_text += f"<span style='color: {get_color(diff)}'>{diff:+.2f} </span>"
+        main_text += ("<span style='color: #27ae60'>✔</span>" if is_success else "<span style='color: #e74c3c'>✘</span>")
+
+        account_text = f"<span style='color: white'>{time_str}</span><br>"
+        account_text += f"<span style='color: white'>Account: ${account_val:,.2f}</span><br>"
+        account_text += f"<span style='color: {get_color(delta)}'>Δ: {delta:+.2f}</span><br>"
+        account_text += f"<span style='color: white'>Invested: ${invested_val:,.2f}</span>"
+
+        main_components = self.plot_components.get(tf)
+        account_components = self.account_plot_components.get(tf)
+
+        if main_components:
+            main_components['label'].setHtml(main_text)
+            main_components['vLine'].setPos(actual_ts)
+            main_components['hLine'].setPos(actual_val)
+            view_rect = main_components['vb'].viewRect()
+            anchor_x = 1 if actual_ts > (view_rect.left() + view_rect.width() * 0.7) else 0
+            main_components['label'].setAnchor((anchor_x, 0.5))
+            main_components['label'].setPos(actual_ts, view_rect.center().y())
+            main_components['vLine'].show()
+            main_components['hLine'].show()
+            main_components['label'].show()
+
+        if account_components:
+            account_components['label'].setHtml(account_text)
+            account_components['vLine'].setPos(actual_ts)
+            account_components['hLine'].setPos(account_val)
+            view_rect = account_components['vb'].viewRect()
+            anchor_x = 1 if actual_ts > (view_rect.left() + view_rect.width() * 0.7) else 0
+            account_components['label'].setAnchor((anchor_x, 0.5))
+            account_components['label'].setPos(actual_ts, view_rect.center().y())
+            account_components['vLine'].show()
+            account_components['hLine'].show()
+            account_components['label'].show()
+
+    def on_mouse_moved(self, pos, tf):
+        if tf not in self.plot_data or not self.plot_data[tf]['indices']:
+            self._hide_tooltips(tf)
             return
 
         components = self.plot_components.get(tf)
         if not components:
+            self._hide_tooltips(tf)
             return
 
         vb = components['vb']
-        if vb.sceneBoundingRect().contains(pos):
-            mousePoint = vb.mapSceneToView(pos)
-            timestamp = mousePoint.x()
+        if not vb.sceneBoundingRect().contains(pos):
+            self._hide_tooltips(tf)
+            return
 
-            # Find the closest index in our data
-            indices = self.plot_data[tf]['indices']
-            actuals = self.plot_data[tf]['actuals']
-            predicts_y = self.plot_data[tf]['predicts_y']
-            successes = self.plot_data[tf]['successes']
+        mousePoint = vb.mapSceneToView(pos)
+        self._sync_tooltips(tf, mousePoint.x())
 
-            if not indices:
-                return
+    def on_account_mouse_moved(self, pos, tf):
+        if tf not in self.account_data or not self.account_data[tf]['timestamps']:
+            self._hide_tooltips(tf)
+            return
 
-            # Find closest timestamp using binary search and distance comparison
-            import bisect
-            idx_pos = bisect.bisect_left(indices, timestamp)
+        components = self.account_plot_components.get(tf)
+        if not components:
+            self._hide_tooltips(tf)
+            return
 
-            # Determine the closest index (left or right) to the cursor
-            if idx_pos == 0:
-                closest_idx = 0
-            elif idx_pos == len(indices):
-                closest_idx = len(indices) - 1
-            else:
-                # Compare distance to the points on either side
-                left_dist = abs(timestamp - indices[idx_pos - 1])
-                right_dist = abs(indices[idx_pos] - timestamp)
-                if left_dist < right_dist:
-                    closest_idx = idx_pos - 1
-                else:
-                    closest_idx = idx_pos
+        vb = components['vb']
+        if not vb.sceneBoundingRect().contains(pos):
+            self._hide_tooltips(tf)
+            return
 
-            if 0 <= closest_idx < len(indices):
-                actual_ts = indices[closest_idx]
-                actual_val = actuals[closest_idx]
-                pred_val = predicts_y[closest_idx]
-                is_success = successes[closest_idx]
-
-                # Calculate changes from previous actual
-                prev_actual = actuals[closest_idx - 1] if closest_idx > 0 else actual_val
-                pred_change = pred_val - prev_actual
-                actual_change = actual_val - prev_actual
-                diff = pred_val - actual_val
-
-                # Colors and symbols
-                def get_color(val):
-                    return "#27ae60" if val >= 0 else "#e74c3c"
-
-                status_icon = "<span style='color: #27ae60'>✔</span>" if is_success else "<span style='color: #e74c3c'>✘</span>"
-
-                # Update crosshair to follow cursor
-                components['vLine'].setPos(mousePoint.x())
-                components['hLine'].setPos(mousePoint.y())
-
-                # Update tooltip text
-                time_str = pd.to_datetime(actual_ts, unit='s').strftime('%Y-%m-%d %H:%M')
-
-                text = f"<span style='color: white'>{time_str}</span><br>"
-
-                # Prediction line
-                text += f"<span style='color: white'>P: {pred_val:.2f} </span>"
-                text += f"<span style='color: {get_color(pred_change)}'>({pred_change:+.2f})</span><br>"
-
-                # Actual line
-                text += f"<span style='color: white'>A: {actual_val:.2f} </span>"
-                text += f"<span style='color: {get_color(actual_change)}'>({actual_change:+.2f})</span><br>"
-
-                # Diff and Status
-                text += f"<span style='color: white'>≅: </span>"
-                text += f"<span style='color: {get_color(diff)}'>{diff:+.2f} </span>{status_icon}"
-
-                components['label'].setHtml(text)
-                # Attach tooltip to cursor
-                components['label'].setPos(mousePoint.x(), mousePoint.y())
-
-                components['vLine'].show()
-                components['hLine'].show()
-                components['label'].show()
-            else:
-                components['vLine'].hide()
-                components['hLine'].hide()
-                components['label'].hide()
-        else:
-            components['vLine'].hide()
-            components['hLine'].hide()
-            components['label'].hide()
+        mousePoint = vb.mapSceneToView(pos)
+        self._sync_tooltips(tf, mousePoint.x(), source='account')
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
