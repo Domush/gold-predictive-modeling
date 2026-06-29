@@ -54,7 +54,7 @@ pip install pyside6 pyqtgraph pandas numpy pygments feather-format
 python main.py
 ```
 
-1. Configure futures account parameters:
+1. Configure account parameters:
    - Set starting capital (default: $10,000)
    - Adjust leverage (1x-50x, default: 12x)
    - Optionally set maximum position value

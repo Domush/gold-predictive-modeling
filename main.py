@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QStackedWidget, QPushButton, QLabel,
                              QPlainTextEdit, QLineEdit, QFormLayout, QGroupBox,
                              QListWidget, QSplitter, QMessageBox, QCheckBox,
-                             QMenu, QSlider, QFileDialog, QSpinBox)
+                             QMenu, QSlider, QFileDialog, QSpinBox, QDoubleSpinBox)
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QSettings, QTimer
 from PySide6.QtGui import QFont, QColor
 
@@ -44,7 +44,7 @@ class RangeSlider(QWidget):
                 width: 14px;
                 height: 14px;
                 margin: -5px 0;
-                border_radius: 7px;
+                border-radius: 7px;
             }
             QSlider::groove:horizontal {
                 border: 1px solid #333;
@@ -92,14 +92,14 @@ class RangeSlider(QWidget):
 
 # --- Worker Thread ---
 class BacktestWorker(QThread):
-    # Signals: timeframe, timestamp, actual, predicted, confidence_pct, is_success, invested, account_value
-    progress = Signal(str, float, float, float, float, bool, float, float)
-    finished = Signal(str, float)
+    # Signals: timeframe, timestamp, actual, predicted, confidence_pct, is_success, invested, account_value, total_count, trades_count, failed_predictions
+    progress = Signal(str, float, float, float, float, bool, float, float, int, int, int)
+    finished = Signal(str, float, int, str, int, int)  # timeframe, success_rate, total_ticks, timespan, trades, failed_predictions
     error = Signal(str)
     aborted = Signal(str, str)
     abort_point = Signal(str, float, float)
 
-    def __init__(self, data, predict_code, timeframe, thresholds, toggles, abort_range, start_capital, leverage, max_position_value, sell_above_max, prediction_offset, confidence_offset):
+    def __init__(self, data, predict_code, timeframe, thresholds, toggles, abort_range, start_capital, leverage, max_position_value, sell_above_max, prediction_offset, confidence_offset, tick_size=0.1, tick_value=1.0):
         super().__init__()
         self.data = data
         self.predict_code = predict_code
@@ -113,12 +113,14 @@ class BacktestWorker(QThread):
         self.sell_above_max = sell_above_max
         self.prediction_offset = prediction_offset
         self.confidence_offset = confidence_offset
-        self.tick_value = 10.0
-        self.tick_size = 0.1
+        self.tick_size = float(tick_size)
+        self.tick_value = float(tick_value)
         self.account_value = float(self.start_capital)
         self.position = 0
         self.entry_contracts = 0
         self._is_running = True
+        self.trades_count = 0
+        self.failed_predictions = 0
 
     def stop(self):
         self._is_running = False
@@ -142,13 +144,14 @@ class BacktestWorker(QThread):
 
             success_count = 0
             total_count = 0
+            prev_position = 0
 
             # Start from row 100
             if len(self.data) > 100:
                 start_idx = 99
                 start_ts = float(self.data.index[start_idx].timestamp())
                 start_actual = self.data.iloc[start_idx]['Close']
-                self.progress.emit(self.timeframe, start_ts, start_actual, start_actual, 0.0, False, 0.0, self.account_value)
+                self.progress.emit(self.timeframe, start_ts, start_actual, start_actual, 0.0, False, 0.0, self.account_value, 0, 0, 0)
 
             for i in range(100, len(self.data)):
                 if not self._is_running:
@@ -201,12 +204,16 @@ class BacktestWorker(QThread):
                     success_count += 1
                 total_count += 1
 
+                # Track failed predictions (predicted positive but actual negative)
+                if predicted > prev_close and actual < prev_close:
+                    self.failed_predictions += 1
+
                 # Account simulation: fixed tick futures contract, long-only.
                 contract_cost = 0.85 * prev_close
                 if self.position == 0:
                     if self.account_value < contract_cost:
                         self.abort_point.emit(self.timeframe, ts, self.account_value)
-                        self.aborted.emit(self.timeframe, f"Stopped: account value below one contract cost (${contract_cost:.2f})")
+                        self.aborted.emit(self.timeframe, f"Account value below one contract cost (${contract_cost:.2f})")
                         return
 
                     base_contracts = int(self.account_value // contract_cost)
@@ -230,6 +237,9 @@ class BacktestWorker(QThread):
                         self.position = 1
                         self.entry_contracts = num_contracts
                         invested_amount = self.entry_contracts * contract_cost
+                        # Track trades when entering a position
+                        if prev_position == 0:
+                            self.trades_count += 1
                     else:
                         invested_amount = 0.0
                 else:
@@ -255,15 +265,18 @@ class BacktestWorker(QThread):
                         self.entry_contracts = 0
                         invested_amount = 0.0
 
+                # Track position for next iteration
+                prev_position = self.position
+
                 ticks = (actual - prev_close) / self.tick_size
                 pnl = self.position * ticks * self.tick_value * num_contracts * self.leverage
                 self.account_value += pnl
 
-                self.progress.emit(self.timeframe, ts, actual, predicted, confidence_pct, is_success, invested_amount, self.account_value)
+                self.progress.emit(self.timeframe, ts, actual, predicted, confidence_pct, is_success, invested_amount, self.account_value, total_count, self.trades_count, self.failed_predictions)
 
                 if self.position == 1 and self.account_value < contract_cost:
                     self.abort_point.emit(self.timeframe, ts, self.account_value)
-                    self.aborted.emit(self.timeframe, f"Stopped: account value below one contract cost (${contract_cost:.2f})")
+                    self.aborted.emit(self.timeframe, f"Account value below one contract cost (${contract_cost:.2f})")
                     return
 
                 # Dynamic delay based on total_count to keep the app responsive as data grows.
@@ -275,7 +288,21 @@ class BacktestWorker(QThread):
                     time.sleep(0.001)
 
             final_rate = (success_count / total_count * 100) if total_count > 0 else 0
-            self.finished.emit(self.timeframe, final_rate)
+            
+            # Calculate timespan based on timeframe and total ticks
+            timeframe_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '1d': 1440}
+            total_minutes = timeframe_minutes.get(self.timeframe, 1) * total_count
+            days = total_minutes // 1440
+            hours = (total_minutes % 1440) // 60
+            minutes = total_minutes % 60
+            if days > 0:
+                timespan = f"{days}d {hours}h {minutes}m"
+            elif hours > 0:
+                timespan = f"{hours}h {minutes}m"
+            else:
+                timespan = f"{minutes}m"
+            
+            self.finished.emit(self.timeframe, final_rate, total_count, timespan, self.trades_count, self.failed_predictions)
 
         except Exception as e:
             self.error.emit(f"Worker Exception: {str(e)}")
@@ -284,7 +311,7 @@ class BacktestWorker(QThread):
 class GoldBacktester(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Gold Futures Backtester Pro")
+        self.setWindowTitle("Trading Algorithm Backtester Pro")
         self.resize(1900, 1400)
 
         self.settings = QSettings("GoldPredictive", "Backtester")
@@ -305,7 +332,10 @@ class GoldBacktester(QMainWindow):
             'confidences': [],
             'colors': [], # List of brush colors
             'successes': [], # List of bools
-            'success_count': 0
+            'success_count': 0,
+            'total_ticks': 0,
+            'trades_count': 0,
+            'failed_predictions': 0
         } for tf in self.timeframes}
 
         self.account_data = {tf: {
@@ -358,6 +388,7 @@ class GoldBacktester(QMainWindow):
         self.settings.setValue("leverage", self.leverage_input.value())
         self.settings.setValue("max_position_value", self.max_position_value.text())
         self.settings.setValue("sell_above_max", self.sell_above_max_checkbox.isChecked())
+        self.settings.setValue("max_ticks", self.max_ticks_slider.value())
         self.settings.setValue("active_timeframe", self.selected_timeframe)
         self.settings.setValue("window_width", self.width())
         self.settings.setValue("window_height", self.height())
@@ -397,6 +428,9 @@ class GoldBacktester(QMainWindow):
         self.max_position_value.setText(self.settings.value("max_position_value", "0"))
         sell_above_max = self.settings.value("sell_above_max", "false")
         self.sell_above_max_checkbox.setChecked(str(sell_above_max).lower() == 'true')
+        max_ticks_val = int(self.settings.value("max_ticks", 30))
+        self.max_ticks_slider.setValue(max_ticks_val)
+        self.on_max_ticks_changed(max_ticks_val)
 
         active_timeframe = self.settings.value("active_timeframe", self.selected_timeframe)
         if active_timeframe in self.tf_radios:
@@ -428,6 +462,16 @@ class GoldBacktester(QMainWindow):
         self.pred_offset_value.setText(f"{value / 10:.1f}")
 
     def update_conf_offset_label(self, value):
+        self.conf_offset_value.setText(str(value))
+
+    def set_pred_offset(self, value):
+        self.pred_offset_slider.setValue(int(value * 10))
+        self.pred_offset_spin.setValue(value)
+        self.pred_offset_value.setText(f"{value:.1f}")
+
+    def set_conf_offset(self, value):
+        self.conf_offset_slider.setValue(value)
+        self.conf_offset_spin.setValue(value)
         self.conf_offset_value.setText(str(value))
 
     def init_ui(self):
@@ -477,6 +521,26 @@ class GoldBacktester(QMainWindow):
         sidebar_layout.addWidget(range_group)
 
         self.range_slider.valueChanged.connect(self.on_range_changed)
+
+        # Max Ticks Group
+        max_ticks_group = QGroupBox("Max Ticks")
+        max_ticks_vbox = QVBoxLayout()
+
+        self.max_ticks_slider = QSlider(Qt.Horizontal)
+        self.max_ticks_slider.setMinimum(10)
+        self.max_ticks_slider.setMaximum(30)
+        self.max_ticks_slider.setValue(30)
+        self.max_ticks_slider.setSingleStep(1)
+        self.max_ticks_slider.setPageStep(1)
+        self.max_ticks_label = QLabel("3000 ticks")
+        self.max_ticks_label.setStyleSheet("font-size: 9pt; color: #3498db;")
+
+        max_ticks_vbox.addWidget(self.max_ticks_label)
+        max_ticks_vbox.addWidget(self.max_ticks_slider)
+        max_ticks_group.setLayout(max_ticks_vbox)
+        sidebar_layout.addWidget(max_ticks_group)
+
+        self.max_ticks_slider.valueChanged.connect(self.on_max_ticks_changed)
 
         # Check feather existence and hide convert button if it exists
         if os.path.exists(self.data_engine.feather_path):
@@ -532,7 +596,8 @@ class GoldBacktester(QMainWindow):
         abort_hbox.addWidget(abort_label)
         abort_hbox.addWidget(self.abort_thresh)
 
-        # Prediction Offset Slider
+        # Prediction Offset Controls
+        pred_offset_vbox = QVBoxLayout()
         offset_hbox = QHBoxLayout()
         offset_label = QLabel("Pred Offset:")
         offset_label.setToolTip("Offset the predicted value by a fixed amount.")
@@ -543,11 +608,26 @@ class GoldBacktester(QMainWindow):
         self.pred_offset_slider.setTickPosition(QSlider.TicksBelow)
         self.pred_offset_slider.setSingleStep(1)
         self.pred_offset_value = QLabel("0.0")
+        self.pred_offset_spin = QDoubleSpinBox()
+        self.pred_offset_spin.setRange(-10.0, 10.0)
+        self.pred_offset_spin.setSingleStep(0.1)
+        self.pred_offset_spin.setDecimals(1)
+        self.pred_offset_spin.setValue(0.0)
+        self.pred_offset_spin.setToolTip("Set prediction offset manually and keep slider in sync.")
+        self.pred_offset_reset = QPushButton("Reset")
+        self.pred_offset_reset.setToolTip("Reset prediction offset to 0.")
         self.pred_offset_slider.valueChanged.connect(self.update_offset_label)
+        self.pred_offset_slider.valueChanged.connect(lambda value: self.pred_offset_spin.setValue(value / 10.0))
+        self.pred_offset_spin.valueChanged.connect(lambda value: self.pred_offset_slider.setValue(int(value * 10)))
+        self.pred_offset_reset.clicked.connect(lambda: self.set_pred_offset(0.0))
         offset_hbox.addWidget(offset_label)
-        offset_hbox.addWidget(self.pred_offset_slider)
         offset_hbox.addWidget(self.pred_offset_value)
+        offset_hbox.addWidget(self.pred_offset_spin)
+        offset_hbox.addWidget(self.pred_offset_reset)
+        pred_offset_vbox.addLayout(offset_hbox)
+        pred_offset_vbox.addWidget(self.pred_offset_slider)
 
+        conf_offset_vbox = QVBoxLayout()
         conf_offset_hbox = QHBoxLayout()
         conf_offset_label = QLabel("Conf Offset:")
         conf_offset_label.setToolTip("Offset the confidence percentage by a fixed amount.")
@@ -560,21 +640,34 @@ class GoldBacktester(QMainWindow):
         self.conf_offset_slider.setPageStep(5)
         self.conf_offset_slider.setTracking(True)
         self.conf_offset_value = QLabel("0")
+        self.conf_offset_spin = QSpinBox()
+        self.conf_offset_spin.setRange(-80, 80)
+        self.conf_offset_spin.setSingleStep(1)
+        self.conf_offset_spin.setValue(0)
+        self.conf_offset_spin.setToolTip("Set confidence offset manually and keep slider in sync.")
+        self.conf_offset_reset = QPushButton("Reset")
+        self.conf_offset_reset.setToolTip("Reset confidence offset to 0.")
         self.conf_offset_slider.valueChanged.connect(self.update_conf_offset_label)
+        self.conf_offset_slider.valueChanged.connect(self.conf_offset_spin.setValue)
+        self.conf_offset_spin.valueChanged.connect(self.conf_offset_slider.setValue)
+        self.conf_offset_reset.clicked.connect(lambda: self.set_conf_offset(0))
         conf_offset_hbox.addWidget(conf_offset_label)
-        conf_offset_hbox.addWidget(self.conf_offset_slider)
         conf_offset_hbox.addWidget(self.conf_offset_value)
+        conf_offset_hbox.addWidget(self.conf_offset_spin)
+        conf_offset_hbox.addWidget(self.conf_offset_reset)
+        conf_offset_vbox.addLayout(conf_offset_hbox)
+        conf_offset_vbox.addWidget(self.conf_offset_slider)
 
         thresh_layout.addLayout(up_hbox)
         thresh_layout.addLayout(down_hbox)
         thresh_layout.addLayout(abort_hbox)
-        thresh_layout.addLayout(offset_hbox)
-        thresh_layout.addLayout(conf_offset_hbox)
+        thresh_layout.addLayout(pred_offset_vbox)
+        thresh_layout.addLayout(conf_offset_vbox)
         thresh_group.setLayout(thresh_layout)
         sidebar_layout.addWidget(thresh_group)
 
-        # Futures Account
-        account_group = QGroupBox("Futures Account")
+        # Trading Account
+        account_group = QGroupBox("Trading Account")
         account_layout = QVBoxLayout()
 
         start_hbox = QHBoxLayout()
@@ -601,12 +694,30 @@ class GoldBacktester(QMainWindow):
         maxpos_hbox.addWidget(maxpos_label)
         maxpos_hbox.addWidget(self.max_position_value)
 
+        tick_size_hbox = QHBoxLayout()
+        self.tick_size_input = QLineEdit("0.1")
+        self.tick_size_input.setPlaceholderText("Tick Size")
+        self.tick_size_input.setToolTip("Price increment represented by one tick.")
+        tick_size_label = QLabel("Tick Size:")
+        tick_size_hbox.addWidget(tick_size_label)
+        tick_size_hbox.addWidget(self.tick_size_input)
+
+        tick_value_hbox = QHBoxLayout()
+        self.tick_value_input = QLineEdit("1.0")
+        self.tick_value_input.setPlaceholderText("Tick Value")
+        self.tick_value_input.setToolTip("Dollar value gained or lost per tick.")
+        tick_value_label = QLabel("Tick Value:")
+        tick_value_hbox.addWidget(tick_value_label)
+        tick_value_hbox.addWidget(self.tick_value_input)
+
         self.sell_above_max_checkbox = QCheckBox("Sell positions above max value")
         self.sell_above_max_checkbox.setChecked(False)
         self.sell_above_max_checkbox.setToolTip("If checked, positions above max value will be sold down to the limit.")
 
         account_layout.addLayout(start_hbox)
         account_layout.addLayout(leverage_hbox)
+        account_layout.addLayout(tick_size_hbox)
+        account_layout.addLayout(tick_value_hbox)
         account_layout.addLayout(maxpos_hbox)
         account_layout.addWidget(self.sell_above_max_checkbox)
         account_group.setLayout(account_layout)
@@ -679,17 +790,61 @@ class GoldBacktester(QMainWindow):
             # Enable tooltips on the plot
             pw.setMouseEnabled(x=True, y=True)
 
-            # Success Rate Label
-            rate_label = QLabel("Success Rate: 0.00%")
-            rate_label.setTextFormat(Qt.RichText)
-            rate_label.setStyleSheet("font-size: 14pt; color: #dcdcdc;")
-            rate_label.setAlignment(Qt.AlignRight)
+            # Stats and Results Row
+            stats_row = QWidget()
+            stats_layout = QHBoxLayout(stats_row)
+            stats_layout.setContentsMargins(0, 0, 0, 0)
+            stats_layout.setSpacing(12)
 
-            tab_layout.addWidget(rate_label)
+            left_row = QWidget()
+            left_layout = QHBoxLayout(left_row)
+            left_layout.setContentsMargins(0, 0, 0, 0)
+            left_layout.setSpacing(12)
+            timespan_label = QLabel("<span style='color: #888;'>Timespan:</span> <span style='color: #dcdcdc;'>0m</span>")
+            trades_label = QLabel("<span style='color: #888;'>Trades:</span> <span style='color: #dcdcdc;'>0</span>")
+            failed_label = QLabel("<span style='color: #888;'>Failed Pred:</span> <span style='color: #dcdcdc;'>0/0</span>")
+            left_layout.addWidget(trades_label)
+            left_layout.addWidget(failed_label)
+            left_layout.addWidget(timespan_label)
+
+            right_row = QWidget()
+            right_layout = QHBoxLayout(right_row)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.setSpacing(12)
+            success_label = QLabel("<span style='color: #27ae60;'>Success Rate:</span> <span style='color: #dcdcdc;'>0.00%</span>")
+            account_label = QLabel("<span style='color: #888;'>Account:</span> <span style='color: #dcdcdc;'>$0.00</span>")
+            abort_label = QLabel("")
+            right_layout.addWidget(success_label)
+            right_layout.addWidget(account_label)
+            right_layout.addWidget(abort_label)
+
+            for label in (timespan_label, trades_label, failed_label, success_label, account_label, abort_label):
+                label.setTextFormat(Qt.RichText)
+                label.setStyleSheet("font-size: 14pt; color: #dcdcdc;")
+
+            timespan_label.setToolTip("Total backtested timespan based on timeframe and tick count.")
+            trades_label.setToolTip("Number of trades entered during the backtest.")
+            failed_label.setToolTip("Failed predictions over total predictions.")
+            success_label.setToolTip("Success rate for the current timeframe.")
+            account_label.setToolTip("Current or final account value for the current timeframe.")
+            abort_label.setToolTip("Abort reason if the backtest stopped early.")
+
+            stats_layout.addWidget(left_row)
+            stats_layout.addStretch()
+            stats_layout.addWidget(right_row)
+
+            tab_layout.addWidget(stats_row)
             tab_layout.addWidget(pw)
 
             self.plot_widgets[tf] = pw
-            self.rate_labels[tf] = rate_label
+            self.rate_labels[tf] = {
+                'timespan': timespan_label,
+                'trades': trades_label,
+                'failed': failed_label,
+                'success': success_label,
+                'account': account_label,
+                'abort': abort_label,
+            }
             self.plot_stack.addWidget(tab)
 
             # Lines
@@ -939,6 +1094,10 @@ class GoldBacktester(QMainWindow):
     def on_range_changed(self, low, high):
         self.update_range_label(low, high)
 
+    def on_max_ticks_changed(self, value):
+        ticks = value * 100
+        self.max_ticks_label.setText(f"{ticks} ticks")
+
     def update_range_label(self, low, high):
          if not hasattr(self, 'start_date_ref'):
              return
@@ -1075,12 +1234,21 @@ class GoldBacktester(QMainWindow):
             'confidences': [],
             'colors': [],
             'successes': [],
-            'success_count': 0
+            'success_count': 0,
+            'total_ticks': 0,
+            'trades_count': 0,
+            'failed_predictions': 0
         }
         self.plot_items[selected_tf].setData([], [])
         self.predict_items[selected_tf].setData([], [])
-        self.rate_labels[selected_tf].setStyleSheet("font-size: 14pt; color: #dcdcdc;")
-        self.rate_labels[selected_tf].setText("Success Rate: 0.00%")
+        labels = self.rate_labels[selected_tf]
+        labels['timespan'].setText("<span style='color: #888;'>Timespan:</span> <span style='color: #dcdcdc;'>0m</span>")
+        labels['trades'].setText("<span style='color: #888;'>Trades:</span> <span style='color: #dcdcdc;'>0</span>")
+        labels['failed'].setText("<span style='color: #888;'>Failed Pred:</span> <span style='color: #dcdcdc;'>0/0</span>")
+        labels['success'].setText("<span style='color: #27ae60;'>Success Rate:</span> <span style='color: #dcdcdc;'>0.00%</span>")
+        labels['account'].setText("<span style='color: #888;'>Account:</span> <span style='color: #dcdcdc;'>$0.00</span>")
+        labels['abort'].setText("")
+
 
         # Autoscale charts at the beginning of the backtest
         try:
@@ -1120,6 +1288,8 @@ class GoldBacktester(QMainWindow):
         sell_above_max = self.sell_above_max_checkbox.isChecked()
         prediction_offset = self.pred_offset_slider.value() / 10.0
         confidence_offset = self.conf_offset_slider.value()
+        tick_size = float(self.tick_size_input.text()) if self.tick_size_input.text().strip() else 0.1
+        tick_value = float(self.tick_value_input.text()) if self.tick_value_input.text().strip() else 1.0
 
         self.account_data[selected_tf] = {
             'timestamps': [],
@@ -1148,10 +1318,36 @@ class GoldBacktester(QMainWindow):
         # Filter by date range
         df_tf = df_tf[(df_tf.index >= start_dt) & (df_tf.index <= end_dt)]
 
+        # Apply max ticks limit (take the most recent rows)
+        max_ticks = self.max_ticks_slider.value() * 100
+        if len(df_tf) > max_ticks:
+            df_tf = df_tf.tail(max_ticks)
+
         if len(df_tf) < 11:
-            self.rate_labels[selected_tf].setText("Insufficient Data")
+            labels = self.rate_labels[selected_tf]
+            labels['timespan'].setText("<span style='color: #888;'>Timespan:</span> <span style='color: #dcdcdc;'>0m</span>")
+            labels['trades'].setText("<span style='color: #888;'>Trades:</span> <span style='color: #dcdcdc;'>0</span>")
+            labels['failed'].setText("<span style='color: #888;'>Failed Pred:</span> <span style='color: #dcdcdc;'>0/0</span>")
+            labels['success'].setText("<span style='color: #27ae60;'>Success Rate:</span> <span style='color: #dcdcdc;'>0.00%</span>")
+            labels['account'].setText("<span style='color: #888;'>Account:</span> <span style='color: #dcdcdc;'>$0.00</span>")
+            labels['abort'].setText("Insufficient Data")
         else:
-            worker = BacktestWorker(df_tf, code, selected_tf, thresholds, toggles, abort_range, start_capital, leverage, max_position_value, sell_above_max, prediction_offset, confidence_offset)
+            worker = BacktestWorker(
+                df_tf,
+                code,
+                selected_tf,
+                thresholds,
+                toggles,
+                abort_range,
+                start_capital,
+                leverage,
+                max_position_value,
+                sell_above_max,
+                prediction_offset,
+                confidence_offset,
+                tick_size,
+                tick_value
+            )
             worker.progress.connect(self.update_plot)
             worker.finished.connect(self.on_worker_finished)
             worker.error.connect(self.on_worker_error)
@@ -1171,8 +1367,8 @@ class GoldBacktester(QMainWindow):
             self.selected_timeframe = selected_tf
             self.plot_stack.setCurrentIndex(self.timeframes.index(selected_tf))
 
-    @Slot(str, float, float, float, float, bool, float, float)
-    def update_plot(self, tf, ts, actual, predicted, confidence_pct, is_success, invested_amount, account_value):
+    @Slot(str, float, float, float, float, bool, float, float, int, int, int)
+    def update_plot(self, tf, ts, actual, predicted, confidence_pct, is_success, invested_amount, account_value, total_ticks, trades_count, failed_predictions):
         d = self.plot_data[tf]
         previous_ts = d['indices'][-1] if d['indices'] else ts
         d['indices'].append(ts)
@@ -1213,6 +1409,11 @@ class GoldBacktester(QMainWindow):
 
         if is_success:
             d['success_count'] += 1
+        
+        # Update live stats
+        d['total_ticks'] = total_ticks
+        d['trades_count'] = trades_count
+        d['failed_predictions'] = failed_predictions
 
         self.plot_items[tf].setData(d['indices'], d['actuals'])
         # For larger backtests, avoid rendering a scatter symbol for every predicted point.
@@ -1246,25 +1447,46 @@ class GoldBacktester(QMainWindow):
         self.sell_plot_items[tf].setData(acc['sell_timestamps'], acc['sell_values'])
         self.abort_plot_items[tf].setData(acc['abort_timestamps'], acc['abort_values'])
 
-        rate = (d['success_count'] / len(d['indices']) * 100)
-        self.rate_labels[tf].setStyleSheet("font-size: 14pt; color: #dcdcdc;")
+        rate = (d['success_count'] / len(d['indices']) * 100) if len(d['indices']) > 0 else 0
+        labels = self.rate_labels[tf]
         account_color = '#27ae60' if account_value > getattr(self, 'current_start_capital', 0.0) else '#ff4d4f' if account_value < getattr(self, 'current_start_capital', 0.0) else '#dcdcdc'
-        self.rate_labels[tf].setText(
-            f"Success Rate: <span style='color: #27ae60;'>{rate:.2f}%</span> | "
-            f"Account: <span style='color: {account_color};'>${account_value:,.2f}</span>"
-        )
+        
+        # Calculate timespan
+        timeframe_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '1d': 1440}
+        total_minutes = timeframe_minutes.get(tf, 1) * d['total_ticks']
+        days = total_minutes // 1440
+        hours = (total_minutes % 1440) // 60
+        minutes = total_minutes % 60
+        if days > 0:
+            timespan = f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            timespan = f"{hours}h {minutes}m"
+        else:
+            timespan = f"{minutes}m"
+        
+        labels = self.rate_labels[tf]
+        labels['timespan'].setText(f"<span style='color: #888;'>Timespan:</span> <span style='color: #dcdcdc;'>{timespan}</span>")
+        labels['trades'].setText(f"<span style='color: #888;'>Trades:</span> <span style='color: #dcdcdc;'>{d['trades_count']}</span>")
+        labels['failed'].setText(f"<span style='color: #888;'>Failed Pred:</span> <span style='color: #dcdcdc;'>{d['failed_predictions']}/{d['total_ticks']}</span>")
+        labels['success'].setText(f"<span style='color: {('#27ae60' if rate >= 0 else '#ff4d4f')}'>Success Rate:</span> <span style='color: #dcdcdc;'>{rate:.2f}%</span>")
+        labels['account'].setText(f"<span style='color: {account_color}'>Account:</span> <span style='color: #dcdcdc;'>${account_value:,.2f}</span>")
+        labels['abort'].setText("")
 
-    @Slot(str, float)
-    def on_worker_finished(self, tf, rate):
+
+    @Slot(str, float, int, str, int, int)
+    def on_worker_finished(self, tf, rate, total_ticks, timespan, trades, failed_predictions):
         final_value = 0.0
         if tf in self.account_data and self.account_data[tf]['account_values']:
             final_value = self.account_data[tf]['account_values'][-1]
-        self.rate_labels[tf].setStyleSheet("font-size: 14pt; color: #dcdcdc;")
+        labels = self.rate_labels[tf]
         account_color = '#27ae60' if final_value > getattr(self, 'current_start_capital', 0.0) else '#ff4d4f' if final_value < getattr(self, 'current_start_capital', 0.0) else '#dcdcdc'
-        self.rate_labels[tf].setText(
-            f"FINAL Success Rate: <span style='color: #27ae60;'>{rate:.2f}%</span> | "
-            f"Final Account: <span style='color: {account_color};'>${final_value:,.2f}</span>"
-        )
+        labels['timespan'].setText(f"<span style='color: #888;'>Timespan:</span> <span style='color: #dcdcdc;'>{timespan}</span>")
+        labels['trades'].setText(f"<span style='color: #888;'>Trades:</span> <span style='color: #dcdcdc;'>{trades}</span>")
+        labels['failed'].setText(f"<span style='color: #888;'>Failed Pred:</span> <span style='color: #dcdcdc;'>{failed_predictions}/{total_ticks}</span>")
+        labels['success'].setText(f"<span style='color: {('#27ae60' if rate >= 0 else '#ff4d4f')}'>FINAL Success Rate:</span> <span style='color: #dcdcdc;'>{rate:.2f}%</span>")
+        labels['account'].setText(f"<span style='color: {account_color}'>Final Account:</span> <span style='color: #dcdcdc;'>${final_value:,.2f}</span>")
+        labels['abort'].setText("")
+
         if tf in self.workers:
             del self.workers[tf]
         if not self.workers:
@@ -1278,8 +1500,31 @@ class GoldBacktester(QMainWindow):
 
     @Slot(str, str)
     def on_worker_aborted(self, tf, reason):
-        self.rate_labels[tf].setText(f"ABORTED: {reason}")
-        self.rate_labels[tf].setStyleSheet("font-size: 14pt; color: #ff0000;")
+        d = self.plot_data.get(tf, {})
+        acc = self.account_data.get(tf, {})
+        labels = self.rate_labels[tf]
+        
+        if d and d.get('total_ticks', 0) > 0:
+            timeframe_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '1d': 1440}
+            total_minutes = timeframe_minutes.get(tf, 1) * d['total_ticks']
+            days = total_minutes // 1440
+            hours = (total_minutes % 1440) // 60
+            minutes = total_minutes % 60
+            if days > 0:
+                timespan = f"{days}d {hours}h {minutes}m"
+            elif hours > 0:
+                timespan = f"{hours}h {minutes}m"
+            else:
+                timespan = f"{minutes}m"
+            labels['timespan'].setText(f"<span style='color: #888;'>Timespan:</span> <span style='color: #dcdcdc;'>{timespan}</span>")
+            labels['trades'].setText(f"<span style='color: #888;'>Trades:</span> <span style='color: #dcdcdc;'>{d['trades_count']}</span>")
+            labels['failed'].setText(f"<span style='color: #888;'>Failed Pred:</span> <span style='color: #dcdcdc;'>{d['failed_predictions']}/{d['total_ticks']}</span>")
+            rate = (d['success_count'] / len(d['indices']) * 100) if len(d['indices']) > 0 else 0
+            account_value = acc.get('last_account_value', acc.get('final_account_value', 0.0))
+            account_color = '#27ae60' if account_value > getattr(self, 'current_start_capital', 0.0) else '#ff4d4f' if account_value < getattr(self, 'current_start_capital', 0.0) else '#dcdcdc'
+            labels['success'].setText(f"<span style='color: {('#27ae60' if rate >= 0 else '#ff4d4f')}'>Success Rate:</span> <span style='color: #dcdcdc;'>{rate:.2f}%</span>")
+            labels['account'].setText(f"<span style='color: {account_color}'>Account:</span> <span style='color: #dcdcdc;'>${account_value:,.2f}</span>")
+        labels['abort'].setText(f"<span style='color: #ff4d4f;'>ABORTED:</span> <span style='color: #dcdcdc;'>{reason}</span>")
         if tf in self.workers:
             del self.workers[tf]
         if not self.workers:
